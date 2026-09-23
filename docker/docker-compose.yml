@@ -1,0 +1,161 @@
+version: "3.9"
+
+services:
+  # ─── Databases ─────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: oracle-postgres
+    environment:
+      POSTGRES_DB: oracle
+      POSTGRES_USER: oracle
+      POSTGRES_PASSWORD: oracle
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init/postgres:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oracle"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oracle-network
+
+  neo4j:
+    image: neo4j:5-enterprise
+    container_name: oracle-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/oracle
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_memory_pagecache_size: 512M
+      NEO4J_dbms_memory_heap_max__size: 1G
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - oracle-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: oracle-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - oracle-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: oracle-minio
+    ports:
+      - "9000:9000"  # API
+      - "9001:9001"  # Console
+    environment:
+      MINIO_ROOT_USER: oracle
+      MINIO_ROOT_PASSWORD: oracle123
+      MINIO_DOMAIN: localhost
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - oracle-network
+
+  # ─── ORACLE Services ──────────────────────────────────────────────────
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: oracle-backend
+    ports:
+      - "8000:8000"
+    environment:
+      ORACLE_ENVIRONMENT: development
+      ORACLE_DATABASE_URL: postgresql+asyncpg://oracle:oracle@postgres:5432/oracle
+      ORACLE_REDIS_URL: redis://redis:6379/0
+      ORACLE_NEO4J_URI: bolt://neo4j:7687
+      ORACLE_NEO4J_USER: neo4j
+      ORACLE_NEO4J_PASSWORD: oracle
+      ORACLE_MINIO_ENDPOINT: minio:9000
+      ORACLE_MINIO_ACCESS_KEY: oracle
+      ORACLE_MINIO_SECRET_KEY: oracle123
+      ORACLE_JWT_SECRET: change-me-in-production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    volumes:
+      - ../:/app
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - oracle-network
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    container_name: oracle-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000/ws
+    depends_on:
+      - backend
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    command: npm run dev
+    networks:
+      - oracle-network
+
+  # ─── Utilities ─────────────────────────────────────────────────────────
+
+  createbuckets:
+    image: minio/mc
+    container_name: oracle-createbuckets
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set oracle http://minio:9000 oracle oracle123;
+      mc mb oracle/oracle-evidence --ignore-existing;
+      mc policy set public oracle/oracle-evidence;
+      echo 'Buckets created successfully';
+      "
+    networks:
+      - oracle-network
+
+volumes:
+  postgres_data:
+  neo4j_data:
+  neo4j_logs:
+  redis_data:
+  minio_data:
+
+networks:
+  oracle-network:
+    driver: bridge

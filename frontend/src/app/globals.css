@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+:root {
+  --background: #020617;
+  --foreground: #f8fafc;
+  --sidebar: #0f172a;
+  --card: #1e293b;
+  --card-hover: #334155;
+  --border: #1e293b;
+  --critical: #ef4444;
+  --high: #f97316;
+  --medium: #eab308;
+  --low: #3b82f6;
+  --info: #6b7280;
+  --success: #22c55e;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-critical: var(--critical);
+  --color-high: var(--high);
+  --color-medium: var(--medium);
+  --color-low: var(--low);
+  --color-info: var(--info);
+  --color-success: var(--success);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* Severity badges */
+.badge-critical {
+  @apply bg-red-500/10 text-red-400 border border-red-500/20;
+}
+.badge-high {
+  @apply bg-orange-500/10 text-orange-400 border border-orange-500/20;
+}
+.badge-medium {
+  @apply bg-yellow-500/10 text-yellow-400 border border-yellow-500/20;
+}
+.badge-low {
+  @apply bg-blue-500/10 text-blue-400 border border-blue-500/20;
+}
+.badge-info {
+  @apply bg-slate-500/10 text-slate-400 border border-slate-500/20;
+}
+
+/* Status badges */
+.badge-active {
+  @apply bg-emerald-500/10 text-emerald-400 border border-emerald-500/20;
+}
+.badge-pending {
+  @apply bg-yellow-500/10 text-yellow-400 border border-yellow-500/20;
+}
+.badge-failed {
+  @apply bg-red-500/10 text-red-400 border border-red-500/20;
+}
+.badge-completed {
+  @apply bg-blue-500/10 text-blue-400 border border-blue-500/20;
+}
+
