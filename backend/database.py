@@ -7,8 +7,10 @@ Async SQLAlchemy engine and session factory for ORACLE.
 
 from __future__ import annotations
 
-from typing import AsyncIterator, Optional
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -56,6 +58,15 @@ async def init_database() -> None:
     # Create tables
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # ``create_all`` does not add columns to an existing deployment.
+        # Keep these additive P1 schema changes idempotent until the project
+        # adopts a dedicated migration runner.
+        await conn.execute(text(
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS total_evidence INTEGER DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE evidence ADD COLUMN IF NOT EXISTS task_id UUID"
+        ))
 
     logger.info(
         "database.initialized",
@@ -74,15 +85,10 @@ async def close_database() -> None:
         logger.info("database.closed")
 
 
-async def get_session() -> AsyncIterator[AsyncSession]:
-    """
-    Get an async database session.
-
-    Yields:
-        An async SQLAlchemy session
-    """
+@asynccontextmanager
+async def session_scope() -> AsyncIterator[AsyncSession]:
+    """Create one transaction-scoped session for a runtime operation."""
     global _session_factory
-
     if _session_factory is None:
         await init_database()
 
@@ -97,6 +103,17 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         await session.close()
 
 
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """
+    Get an async database session.
+
+    Yields:
+        An async SQLAlchemy session
+    """
+    async with session_scope() as session:
+        yield session
+
+
 async def get_db() -> AsyncIterator[AsyncSession]:
     """FastAPI dependency for database sessions."""
     async for session in get_session():
@@ -107,5 +124,6 @@ __all__ = [
     "init_database",
     "close_database",
     "get_session",
+    "session_scope",
     "get_db",
 ]

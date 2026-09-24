@@ -17,14 +17,13 @@ This is the reference implementation for all future agents.
 from __future__ import annotations
 
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from core.events import EventType, OracleEvent
 from core.interfaces import AgentStatus, Capability, Evidence, OracleAgent
 from core.logging import get_logger, get_mission_logger
 from domain.asset import Asset, AssetType, AssetCriticality
-from domain.evidence import Evidence as EvidenceModel, EvidenceType
-from domain.mission import Mission, MissionStatus, MissionTarget
+from domain.mission import Mission
 from runtime.event_bus import get_event_bus
 from runtime.state_manager import StateManager
 from tools.common import HostInfo
@@ -584,19 +583,11 @@ class DiscoveryAgent(OracleAgent):
             ):
                 raw_output += chunk
         except Exception as e:
-            # A Nuclei failure (binary missing, targets unreachable, etc.)
-            # shouldn't take down the rest of the mission — surface it as
-            # low-confidence evidence instead of propagating the exception,
-            # matching how port_scan degrades on zero hosts found.
-            logger.warning("discovery_agent.nuclei_scan_failed", error=str(e))
-            yield Evidence(
-                source="discovery_agent",
-                evidence_type="scan_result",
-                asset_value="vulnerability_scan",
-                data={"error": str(e), "targets": targets},
-                confidence=0.0,
-            )
-            return
+            # Tool failures are execution failures, not evidence. The outer
+            # agent boundary converts this into an error result so the task
+            # and workflow cannot report success.
+            logger.error("discovery_agent.nuclei_scan_failed", error=str(e))
+            raise
 
         findings = await self._nuclei.parse(raw_output)
         evidence_list = await self._nuclei.normalize(findings)

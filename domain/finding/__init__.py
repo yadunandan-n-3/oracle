@@ -40,6 +40,7 @@ class Finding(BaseModel):
     title: str
     description: str = ""
     severity: FindingSeverity = FindingSeverity.MEDIUM
+    confidence: float = 0.0
     status: FindingStatus = FindingStatus.OPEN
     asset_id: Optional[UUID] = None
     asset_value: str = ""
@@ -62,6 +63,11 @@ class Finding(BaseModel):
     data_classification: str = ""
     internet_exposed: bool = False
     authentication_required: bool = False
+    risk_score: Optional[float] = None
+    risk_level: str = "none"
+    risk_factors: List[Dict[str, Any]] = Field(default_factory=list)
+    risk_explanation: Optional[Dict[str, Any]] = None
+    risk_calculation_metadata: Dict[str, Any] = Field(default_factory=dict)
     mission_id: Optional[UUID] = None
     project_id: Optional[UUID] = None
     tags: List[str] = Field(default_factory=list)

@@ -11,14 +11,13 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
 
 from core.logging import get_logger
 from domain.finding import FindingSeverity
-from domain.risk import RiskLevel
 from runtime.runtime import get_runtime, OracleRuntime
 
 logger = get_logger(__name__)
@@ -82,13 +81,23 @@ async def _build_dashboard_data(runtime: OracleRuntime) -> Dict[str, Any]:
     # ─── Evidence Summary ───────────────────────────────────────────────
     total_evidence = 0
 
-    # Use public accessor instead of direct _states access
+    # PostgreSQL is authoritative when available. Runtime state is an
+    # explicit degraded-mode fallback for installations without persistence.
     all_states = state_manager.get_all_states()
+    persisted_missions = await runtime.get_authoritative_missions()
+    persisted_findings = await runtime.get_authoritative_findings()
+    persisted_by_mission: Dict[UUID, List[Any]] = {}
+    if persisted_findings is not None:
+        for finding in persisted_findings:
+            persisted_by_mission.setdefault(finding.mission_id, []).append(finding)
 
-    # Iterate over all mission states
-    for mission_state in all_states.values():
+    if persisted_missions is not None:
+        mission_sources = [(mission, None) for mission in persisted_missions]
+    else:
+        mission_sources = [(state.mission, state) for state in all_states.values()]
+
+    for mission, mission_state in mission_sources:
         try:
-            mission = mission_state.mission
             total_missions += 1
             status = mission.status.value if hasattr(mission.status, 'value') else str(mission.status)
             mission_status_counts[status] += 1
@@ -109,7 +118,7 @@ async def _build_dashboard_data(runtime: OracleRuntime) -> Dict[str, Any]:
                 "status": status,
                 "mission_type": mtype,
                 "priority": mission.priority.value if hasattr(mission.priority, 'value') else str(mission.priority),
-                "total_assets": mission_state.total_assets,
+                "total_assets": mission.total_assets_discovered,
                 "total_findings": mission.total_findings,
                 "critical_findings": mission.critical_findings,
                 "high_findings": mission.high_findings,
@@ -118,22 +127,32 @@ async def _build_dashboard_data(runtime: OracleRuntime) -> Dict[str, Any]:
             })
 
             # Assets
-            total_assets += mission_state.total_assets
-            for asset in mission_state.assets.values():
+            if persisted_missions is not None:
+                assets = await runtime.get_authoritative_assets(mission.id) or []
+            else:
+                assets = list(mission_state.assets.values()) if mission_state else []
+            total_assets += len(assets)
+            for asset in assets:
                 atype = asset.asset_type.value if hasattr(asset.asset_type, 'value') else str(asset.asset_type)
                 asset_type_counts[atype] += 1
 
             # Evidence
-            total_evidence += mission_state.total_evidence
+            total_evidence += mission.total_evidence
 
             # Findings
-            findings = state_manager.get_findings(mission.id)
+            findings = (
+                persisted_by_mission.get(mission.id, [])
+                if persisted_findings is not None
+                else state_manager.get_findings(mission.id)
+            )
             total_findings += len(findings)
 
             all_findings_sorted = sorted(
                 findings,
                 key=lambda f: (
-                    0 if f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH) else 1,
+                    0 if (
+                        f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+                    ) in {FindingSeverity.CRITICAL.value, FindingSeverity.HIGH.value} else 1,
                     -(f.risk_score or 0),
                 ),
             )
@@ -173,7 +192,7 @@ async def _build_dashboard_data(runtime: OracleRuntime) -> Dict[str, Any]:
                     "discovered_at": finding.discovered_at.isoformat() if hasattr(finding, 'discovered_at') else None,
                 })
         except Exception as e:
-            logger.warning("dashboard.mission_processing_failed", mission_id=str(mission_state.mission.id), error=str(e))
+            logger.warning("dashboard.mission_processing_failed", mission_id=str(mission.id), error=str(e))
             continue
 
     # Sort recent missions by created_at (most recent first)

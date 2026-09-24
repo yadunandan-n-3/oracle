@@ -12,7 +12,6 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from core.exceptions import ResourceNotFoundError, ValidationError
 from core.logging import get_logger
 from domain.mission import Mission, MissionStatus, MissionTarget, MissionType
 from runtime.runtime import get_runtime, OracleRuntime
@@ -53,6 +52,7 @@ class MissionResponse(BaseModel):
     priority: str
     status: str
     total_assets_discovered: int
+    total_evidence: int
     total_findings: int
     critical_findings: int
     high_findings: int
@@ -224,6 +224,7 @@ def _mission_to_response(mission: Mission) -> Dict[str, Any]:
         "priority": mission.priority.value,
         "status": mission.status.value,
         "total_assets_discovered": mission.total_assets_discovered,
+        "total_evidence": mission.total_evidence,
         "total_findings": mission.total_findings,
         "critical_findings": mission.critical_findings,
         "high_findings": mission.high_findings,

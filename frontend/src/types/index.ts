@@ -125,6 +125,34 @@ export interface FindingDetail extends FindingSummary {
   internet_exposed: boolean;
   authentication_required: boolean;
   confidence: number;
+  risk_level: string;
+  risk_factors: Array<{
+    name: string;
+    value: number;
+    weight: number;
+    evidence: string;
+    source: string;
+  }>;
+  risk_explanation: {
+    summary: string;
+    reasoning: string;
+    top_factors: string[];
+  } | null;
+  risk_calculation_metadata: {
+    risk_id?: string | null;
+    calculated_at?: string | null;
+    calculated_by?: string | null;
+    engine?: string | null;
+  };
+  intelligence_status: string;
+  threat_intelligence: {
+    cve?: { cve_id: string; cvss_score: number | null; description: string } | null;
+    cwe?: { cwe_id: string; name: string; description: string } | null;
+    owasp?: { owasp_id: string; category: string } | null;
+    epss?: { epss_score: number; percentile: number } | null;
+    kev?: { cve_id: string; vulnerability_name: string; required_action: string } | null;
+    provider_status?: Record<string, string>;
+  };
   evidence_ids: string[];
   tags: string[];
   updated_at: string;

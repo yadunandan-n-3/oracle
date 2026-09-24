@@ -85,8 +85,10 @@ async def test_scheduler_preserves_task_metadata(event_bus: Any) -> None:
     captured: list[Task] = []
     executed = asyncio.Event()
     dependency_id = uuid4()
+    goal_id = uuid4()
     task = Task(
         mission_id=uuid4(),
+        goal_id=goal_id,
         name="metadata",
         description="Preserve every execution field",
         priority=TaskPriority.HIGH,
@@ -114,11 +116,15 @@ async def test_scheduler_preserves_task_metadata(event_bus: Any) -> None:
         await asyncio.wait_for(executed.wait(), timeout=1)
         assert captured == [task]
         assert captured[0] is task
+        assert captured[0].id == task.id
+        assert captured[0].name == "metadata"
+        assert captured[0].goal_id == goal_id
         assert captured[0].capability == "metadata_capability"
         assert captured[0].required_capabilities == [
             "metadata_capability",
             "fallback_capability",
         ]
+        assert captured[0].required_tools == ["fake_tool"]
         assert captured[0].target == "metadata.oracle.test"
         assert captured[0].params == {"depth": 3}
         assert captured[0].config == {"mode": "safe"}
@@ -131,7 +137,7 @@ async def test_scheduler_preserves_task_metadata(event_bus: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_handler_fails_workflow(event_bus: Any) -> None:
+async def test_missing_handler_does_not_complete_task(event_bus: Any) -> None:
     scheduler, _, engine = await make_running_engine()
     mission = make_mission(domains=["missing-handler.oracle.test"])
     task = make_plan_task(mission.id, capability="not_registered")
@@ -148,7 +154,7 @@ async def test_missing_handler_fails_workflow(event_bus: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_dependency_wave_execution(event_bus: Any) -> None:
+async def test_dependency_wave_advances(event_bus: Any) -> None:
     scheduler, _, engine = await make_running_engine()
     mission = make_mission(domains=["waves.oracle.test"])
     first = make_plan_task(mission.id, name="first")
@@ -207,6 +213,8 @@ async def test_mission_does_not_complete_before_workflow(event_bus: Any) -> None
         assert result is not None and result.succeeded
         assert mission.status == MissionStatus.COMPLETED
         assert mission.completed_at is not None
+        assert task.status == TaskStatus.COMPLETED
+        assert not runtime.workflow_engine.get_active_workflows()
     finally:
         release.set()
         await runtime.scheduler.stop()
@@ -233,7 +241,7 @@ async def test_planner_failure_marks_mission_failed(event_bus: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_task_failure_fails_workflow(event_bus: Any) -> None:
+async def test_task_failure_marks_workflow_failed(event_bus: Any) -> None:
     scheduler, _, engine = await make_running_engine()
     mission = make_mission(domains=["task-failure.oracle.test"])
     task = make_plan_task(mission.id, capability="failing")
@@ -252,7 +260,7 @@ async def test_task_failure_fails_workflow(event_bus: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_workflow_timeout_is_terminal(event_bus: Any) -> None:
+async def test_workflow_timeout_marks_failure(event_bus: Any) -> None:
     scheduler, _, engine = await make_running_engine()
     mission = make_mission(domains=["timeout.oracle.test"])
     task = make_plan_task(mission.id, capability="blocking")
@@ -277,7 +285,7 @@ async def test_workflow_timeout_is_terminal(event_bus: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_handler_registration_precedes_dispatch(event_bus: Any) -> None:
+async def test_handler_registration_before_dispatch(event_bus: Any) -> None:
     scheduler = Scheduler(max_concurrent=1, poll_interval=0.001)
     engine = WorkflowEngine(scheduler, StateManager(), Planner())
     mission = make_mission(domains=["registration.oracle.test"])
@@ -301,7 +309,7 @@ async def test_handler_registration_precedes_dispatch(event_bus: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_missions_use_isolated_discovery_agents(
+async def test_concurrent_missions_isolate_agent_state(
     event_bus: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -335,7 +343,7 @@ async def test_concurrent_missions_use_isolated_discovery_agents(
 
 
 @pytest.mark.asyncio
-async def test_full_external_plan_completes_with_fake_handlers(event_bus: Any) -> None:
+async def test_full_external_attack_surface_plan_execution(event_bus: Any) -> None:
     scheduler, planner, engine = await make_running_engine()
     mission = make_mission(
         mission_type=MissionType.EXTERNAL_ATTACK_SURFACE,

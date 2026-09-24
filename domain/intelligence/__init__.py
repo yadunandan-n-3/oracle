@@ -127,6 +127,9 @@ class ThreatIntelligence(BaseModel):
     epss: Optional[EPSSInfo] = None
     kev: Optional[KEVInfo] = None
     mitre: List[MitreIntelInfo] = Field(default_factory=list)
+    provider_status: Dict[str, str] = Field(default_factory=dict)
+    provider_errors: Dict[str, str] = Field(default_factory=dict)
+    degraded: bool = False
     enriched_at: datetime = Field(default_factory=datetime.now)
 
     model_config = {"extra": "allow"}

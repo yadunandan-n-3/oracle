@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import (
     ARRAY,
     Boolean,
-    Column,
     DateTime,
     Float,
     ForeignKey,
@@ -24,10 +23,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    func,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.ext.asyncio import AsyncAttrs, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -115,6 +113,7 @@ class MissionModel(Base):
 
     # Results
     total_assets_discovered: Mapped[int] = mapped_column(Integer, default=0)
+    total_evidence: Mapped[int] = mapped_column(Integer, default=0)
     total_findings: Mapped[int] = mapped_column(Integer, default=0)
     critical_findings: Mapped[int] = mapped_column(Integer, default=0)
     high_findings: Mapped[int] = mapped_column(Integer, default=0)
@@ -184,6 +183,7 @@ class EvidenceModel(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
     mission_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("missions.id"), nullable=False)
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     evidence_type: Mapped[str] = mapped_column(String(50), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="collected")
     title: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -207,7 +207,9 @@ class EvidenceModel(Base):
     normalized_data: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
 
     # Correlations
-    correlated_evidence_ids: Mapped[List[str]] = mapped_column(ARRAY(String), default=list)
+    correlated_evidence_ids: Mapped[List[uuid.UUID]] = mapped_column(
+        ARRAY(UUID(as_uuid=True)), default=list
+    )
 
     # Security references
     cve_ids: Mapped[List[str]] = mapped_column(ARRAY(String), default=list)
@@ -255,7 +257,9 @@ class FindingModel(Base):
     asset_type: Mapped[str] = mapped_column(String(50), default="")
 
     # Evidence
-    evidence_ids: Mapped[List[str]] = mapped_column(ARRAY(String), default=list)
+    evidence_ids: Mapped[List[uuid.UUID]] = mapped_column(
+        ARRAY(UUID(as_uuid=True)), default=list
+    )
 
     # Vuln references
     cve_id: Mapped[Optional[str]] = mapped_column(String(20))

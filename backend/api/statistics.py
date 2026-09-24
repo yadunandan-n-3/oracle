@@ -7,7 +7,7 @@ Aggregate statistics across all missions.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
@@ -42,9 +42,22 @@ async def get_overview_stats(
 
     severity_distribution = {"critical": 0, "high": 0, "medium": 0, "low": 0, "informational": 0}
     status_distribution = {"draft": 0, "planning": 0, "in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0}
+    persisted_findings = await runtime.get_authoritative_findings()
+    persisted_missions = await runtime.get_authoritative_missions()
+    persisted_by_mission: Dict[UUID, list[Any]] = {}
+    if persisted_findings is not None:
+        for finding in persisted_findings:
+            persisted_by_mission.setdefault(finding.mission_id, []).append(finding)
 
-    for mission_state in state_manager._states.values():
-        mission = mission_state.mission
+    if persisted_missions is not None:
+        mission_sources = [(mission, None) for mission in persisted_missions]
+    else:
+        mission_sources = [
+            (mission_state.mission, mission_state)
+            for mission_state in state_manager.get_all_states().values()
+        ]
+
+    for mission, mission_state in mission_sources:
         total_missions += 1
 
         status = mission.status.value if hasattr(mission.status, 'value') else str(mission.status)
@@ -60,10 +73,22 @@ async def get_overview_stats(
         elif status == "cancelled":
             cancelled_missions += 1
 
-        total_assets += len(mission_state.assets)
-        total_evidence += len(mission_state.evidence)
+        total_assets += (
+            mission.total_assets_discovered
+            if persisted_missions is not None
+            else len(mission_state.assets)
+        )
+        total_evidence += (
+            mission.total_evidence
+            if persisted_missions is not None
+            else len(mission_state.evidence)
+        )
 
-        findings = state_manager.get_findings(mission.id)
+        findings = (
+            persisted_by_mission.get(mission.id, [])
+            if persisted_findings is not None
+            else state_manager.get_findings(mission.id)
+        )
         total_findings += len(findings)
         for finding in findings:
             sev = finding.severity.value if hasattr(finding.severity, 'value') else str(finding.severity)
@@ -121,8 +146,15 @@ async def get_risk_distribution(
     }
 
     risk_scores = []
-    for mission_state in state_manager._states.values():
-        findings = state_manager.get_findings(mission_state.mission.id)
+    persisted_findings = await runtime.get_authoritative_findings()
+    if persisted_findings is not None:
+        finding_groups = [persisted_findings]
+    else:
+        finding_groups = [
+            state_manager.get_findings(mission_state.mission.id)
+            for mission_state in state_manager._states.values()
+        ]
+    for findings in finding_groups:
         for finding in findings:
             if finding.risk_score is not None:
                 risk_scores.append(finding.risk_score)

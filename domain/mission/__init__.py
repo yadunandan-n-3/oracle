@@ -116,6 +116,7 @@ class Mission(BaseModel):
 
     # Results summary
     total_assets_discovered: int = 0
+    total_evidence: int = 0
     total_findings: int = 0
     critical_findings: int = 0
     high_findings: int = 0

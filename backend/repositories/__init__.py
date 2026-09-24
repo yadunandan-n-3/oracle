@@ -317,6 +317,17 @@ class FindingRepository(BaseRepository):
     def __init__(self, session: AsyncSession) -> None:
         super().__init__(session, FindingModel)
 
+    async def upsert(self, data: Dict[str, Any]) -> FindingModel:
+        """Create or update a deterministic finding by primary key."""
+        existing = await self.get(data["id"])
+        if existing:
+            for key, value in data.items():
+                if hasattr(existing, key) and key not in ("id", "mission_id", "created_at"):
+                    setattr(existing, key, value)
+            await self._session.flush()
+            return existing
+        return await self.create(data)
+
     async def list_by_mission(
         self,
         mission_id: UUID,

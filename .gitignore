@@ -29,3 +29,21 @@ docker/logs/
 # Node
 node_modules/
 .next/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Logs
+*.log
+
+# Secrets / credentials
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS
+Thumbs.db

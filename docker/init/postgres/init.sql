@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS missions (
 
     -- Results summary
     total_assets_discovered INTEGER DEFAULT 0,
+    total_evidence          INTEGER DEFAULT 0,
     total_findings          INTEGER DEFAULT 0,
     critical_findings       INTEGER DEFAULT 0,
     high_findings           INTEGER DEFAULT 0,
@@ -189,6 +190,7 @@ CREATE INDEX IF NOT EXISTS idx_assets_value ON assets(value);
 CREATE TABLE IF NOT EXISTS evidence (
     id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     mission_id          UUID NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    task_id             UUID,
     evidence_type       VARCHAR(50) NOT NULL,
     status              VARCHAR(20) DEFAULT 'collected',
     title               VARCHAR(255) NOT NULL,
@@ -241,6 +243,10 @@ CREATE INDEX IF NOT EXISTS idx_evidence_mission ON evidence(mission_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_type ON evidence(evidence_type);
 CREATE INDEX IF NOT EXISTS idx_evidence_asset ON evidence(asset_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(hash);
+
+-- Backfill columns for databases created before the production pipeline.
+ALTER TABLE missions ADD COLUMN IF NOT EXISTS total_evidence INTEGER DEFAULT 0;
+ALTER TABLE evidence ADD COLUMN IF NOT EXISTS task_id UUID;
 
 -- ============================================================================
 -- Findings

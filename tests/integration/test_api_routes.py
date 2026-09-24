@@ -14,6 +14,11 @@ from tests.conftest import make_finding, make_mission
 @pytest.fixture
 def client() -> TestClient:
     with TestClient(app) as test_client:
+        runtime = get_runtime()
+        # This module seeds runtime-only records and validates the documented
+        # degraded-mode fallback. Make that mode explicit even when a local
+        # PostgreSQL server happens to be running.
+        runtime._database_available = False
         yield test_client
 
 

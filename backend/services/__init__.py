@@ -28,14 +28,12 @@ from backend.repositories import (
     EventLogRepository,
     FindingRepository,
     MissionRepository,
-    OrganizationRepository,
-    UserRepository,
 )
-from core.events import EventType
 from core.logging import get_logger
 from domain.asset import Asset
 from domain.evidence import Evidence
-from domain.mission import Mission, MissionStatus, MissionTarget
+from domain.finding import Finding
+from domain.mission import Mission, MissionStatus
 
 logger = get_logger(__name__)
 
@@ -72,8 +70,15 @@ class MissionService:
             "max_duration_minutes": mission.max_duration_minutes,
             "schedule": mission.schedule,
             "auto_remediate": mission.auto_remediate,
+            "total_assets_discovered": mission.total_assets_discovered,
+            "total_evidence": mission.total_evidence,
+            "total_findings": mission.total_findings,
+            "critical_findings": mission.critical_findings,
+            "high_findings": mission.high_findings,
+            "medium_findings": mission.medium_findings,
+            "low_findings": mission.low_findings,
             "tags": mission.tags,
-            "goals": [g.model_dump() for g in mission.goals],
+            "goals": [g.model_dump(mode="json") for g in mission.goals],
             "metadata_": mission.metadata,
         }
         return await self._mission_repo.create(data)
@@ -130,8 +135,13 @@ class MissionService:
             "open_ports": asset.open_ports,
             "services": asset.services,
             "technologies": list(asset.technologies) if hasattr(asset, 'technologies') else [],
+            "mac_address": asset.mac_address,
             "os": asset.os if hasattr(asset, 'os') else None,
+            "os_version": asset.os_version,
             "tags": asset.tags,
+            "metadata_": asset.metadata,
+            "first_seen_at": asset.first_seen_at,
+            "last_seen_at": asset.last_seen_at,
         }
         return await self._asset_repo.upsert(mission_id, data)
 
@@ -154,6 +164,7 @@ class MissionService:
         data = {
             "id": evidence.id,
             "mission_id": mission_id,
+            "task_id": evidence.task_id,
             "evidence_type": evidence.evidence_type.value if hasattr(evidence.evidence_type, 'value') else evidence.evidence_type,
             "status": evidence.status.value if hasattr(evidence.status, 'value') else "collected",
             "title": evidence.title,
@@ -164,15 +175,22 @@ class MissionService:
             "source_tool_version": evidence.source.tool_version if hasattr(evidence, 'source') and hasattr(evidence.source, 'tool_version') else "",
             "source_command": evidence.source.command if hasattr(evidence, 'source') and hasattr(evidence.source, 'command') else "",
             "source_agent_name": evidence.source.agent_name if hasattr(evidence, 'source') and hasattr(evidence.source, 'agent_name') else "",
+            "source_execution_id": evidence.source.execution_id,
             "asset_id": evidence.asset_id,
             "asset_value": evidence.asset_value,
             "raw_data": evidence.raw_data,
             "normalized_data": evidence.normalized_data,
+            "correlated_evidence_ids": list(evidence.correlated_evidence_ids),
             "cve_ids": evidence.cve_ids,
             "cwe_ids": evidence.cwe_ids,
             "mitre_techniques": evidence.mitre_techniques,
             "hash": evidence.hash if hasattr(evidence, 'hash') and evidence.hash else "",
             "tags": evidence.tags,
+            "metadata_": evidence.metadata,
+            "validated_at": evidence.validated_at,
+            "validated_by": evidence.validated_by,
+            "validation_method": evidence.validation_method,
+            "collected_at": evidence.collected_at,
         }
         return await self._evidence_repo.create(data)
 
@@ -188,6 +206,102 @@ class MissionService:
         return await self._evidence_repo.list_by_mission(
             mission_id, evidence_type, asset_id, limit, offset
         )
+
+    # ─── Finding Operations ─────────────────────────────────────────────
+
+    async def upsert_finding(self, mission_id: UUID, finding: Finding) -> FindingModel:
+        """Persist a finding produced by correlation or explicit vulnerability evidence."""
+        data = {
+            "id": finding.id,
+            "mission_id": mission_id,
+            "title": finding.title,
+            "description": finding.description,
+            "severity": finding.severity.value,
+            "status": finding.status.value,
+            "confidence": finding.confidence,
+            "asset_id": finding.asset_id,
+            "asset_value": finding.asset_value,
+            "asset_type": finding.asset_type,
+            "evidence_ids": list(finding.evidence_ids),
+            "cve_id": finding.cve_id,
+            "cwe_id": finding.cwe_id,
+            "cvss_score": finding.cvss_score,
+            "cvss_vector": finding.cvss_vector,
+            "mitre_technique_id": finding.mitre_technique_id,
+            "mitre_tactic": finding.mitre_tactic,
+            "remediation_steps": finding.remediation_steps,
+            "remediation_effort": finding.remediation_effort,
+            "remediation_deadline": finding.remediation_deadline,
+            "proof_of_concept": finding.proof_of_concept,
+            "affected_component": finding.affected_component,
+            "affected_url": finding.affected_url,
+            "affected_port": finding.affected_port,
+            "business_impact": finding.business_impact,
+            "data_classification": finding.data_classification,
+            "internet_exposed": finding.internet_exposed,
+            "authentication_required": finding.authentication_required,
+            "risk_score": finding.risk_score,
+            "discovered_by": finding.discovered_by,
+            "assigned_to": finding.assigned_to,
+            "discovered_at": finding.discovered_at,
+            "resolved_at": finding.resolved_at,
+            "tags": finding.tags,
+            "metadata_": finding.metadata,
+        }
+        return await self._finding_repo.upsert(data)
+
+    async def get_finding(self, finding_id: UUID) -> Optional[FindingModel]:
+        """Load one authoritative persisted finding."""
+        return await self._finding_repo.get(finding_id)
+
+    async def list_findings(
+        self,
+        mission_id: Optional[UUID] = None,
+        severity: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 10000,
+        offset: int = 0,
+    ) -> List[FindingModel]:
+        """Load authoritative persisted findings with API-level filters."""
+        filters: Dict[str, Any] = {}
+        if mission_id is not None:
+            filters["mission_id"] = mission_id
+        if severity:
+            filters["severity"] = severity
+        if status:
+            filters["status"] = status
+        return await self._finding_repo.list(
+            filters=filters,
+            order_by="-discovered_at",
+            limit=limit,
+            offset=offset,
+        )
+
+    async def sync_mission_counters(
+        self,
+        mission_id: UUID,
+        *,
+        total_assets: int,
+        total_evidence: int,
+        total_findings: int,
+        critical_findings: int,
+        high_findings: int,
+        medium_findings: int,
+        low_findings: int,
+        overall_risk_score: Optional[float] = None,
+    ) -> MissionModel:
+        """Write counters derived from records instead of incrementing caches."""
+        mission = await self._mission_repo.get_or_raise(mission_id)
+        mission.total_assets_discovered = total_assets
+        mission.total_evidence = total_evidence
+        mission.total_findings = total_findings
+        mission.critical_findings = critical_findings
+        mission.high_findings = high_findings
+        mission.medium_findings = medium_findings
+        mission.low_findings = low_findings
+        mission.overall_risk_score = overall_risk_score
+        await self._session.flush()
+        return mission
 
     # ─── Event Log Operations ───────────────────────────────────────────
 

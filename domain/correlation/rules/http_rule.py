@@ -14,7 +14,7 @@ Example:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from domain.correlation import CorrelationResult, CorrelationRule, CorrelationType
 from domain.evidence import Evidence
@@ -65,8 +65,10 @@ class HttpServiceCorrelationRule(CorrelationRule):
                         "protocol": "tcp",
                         "technologies": set(),
                         "tags": set(),
+                        "evidence_ids": [],
                     }
                 self._update_http_asset_info(nmap_http_assets[key], evidence)
+                nmap_http_assets[key]["evidence_ids"].append(evidence.id)
 
             elif evidence.evidence_type.value == "vulnerability" and evidence.source.tool_name == "nuclei":
                 key = self._build_asset_key(evidence)
@@ -85,7 +87,7 @@ class HttpServiceCorrelationRule(CorrelationRule):
                     correlation_type=CorrelationType.SERVICE_MATCH,
                     rule_name=self.name,
                     confidence=0.5,
-                    evidence_ids=[],
+                    evidence_ids=http_info["evidence_ids"],
                     asset_value=ip or http_info["asset_value"],
                     technology="http" if port != 443 else "https",
                     service="http",
@@ -104,7 +106,7 @@ class HttpServiceCorrelationRule(CorrelationRule):
                     if cve not in correlated_cves:
                         correlated_cves.append(cve)
 
-            evidence_ids = [ev.id for ev in matching_vulns if ev.id]
+            evidence_ids = [*http_info["evidence_ids"], *[ev.id for ev in matching_vulns if ev.id]]
             ip, port, protocol = self._parse_asset_value(http_info["asset_value"])
 
             cve_descriptions = ", ".join(correlated_cves[:3]) if correlated_cves else "vulnerability"
@@ -169,7 +171,6 @@ class HttpServiceCorrelationRule(CorrelationRule):
             info["port"] = port
         info["protocol"] = protocol
 
-        service = raw_data.get("service", "")
         product = raw_data.get("service_product", "")
         version = raw_data.get("service_version", "")
 

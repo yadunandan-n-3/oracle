@@ -7,13 +7,15 @@ Generate, list, and retrieve security reports.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core.logging import get_logger
-from domain.report import ReportFormat, ReportType, Report
+from domain.finding import Finding
+from domain.mission import Mission, MissionTarget
+from domain.report import ReportFormat, ReportType
 from domain.report.generator import ReportGenerator
 from runtime.runtime import get_runtime, OracleRuntime
 
@@ -33,18 +35,16 @@ async def list_reports(
     """List all generated reports."""
     state_manager = runtime.state_manager
     reports = []
-
-    missions_to_check = []
-    if mission_id:
-        missions_to_check.append(UUID(mission_id))
+    persisted_missions = await runtime.get_authoritative_missions()
+    if persisted_missions is not None:
+        missions = persisted_missions
     else:
-        for mission_state in state_manager._states.values():
-            missions_to_check.append(mission_state.mission.id)
+        missions = [state.mission for state in state_manager.get_all_states().values()]
+    if mission_id:
+        missions = [mission for mission in missions if mission.id == UUID(mission_id)]
 
-    for mid in missions_to_check:
-        state = await state_manager.get_mission_state(mid)
-        if state:
-            mission = state.mission
+    for mission in missions:
+        if mission:
             report_type_filter = report_type or "technical_detail"
             try:
                 report_type_enum = ReportType(report_type_filter)
@@ -89,18 +89,30 @@ async def get_report(
     """Get a report for a mission."""
     state_manager = runtime.state_manager
     state = await state_manager.get_mission_state(mission_id)
-
-    if not state:
-        # Try to find the mission from the mission manager
+    persisted_mission = await runtime.get_authoritative_mission(mission_id)
+    if persisted_mission is not None:
+        mission = _as_domain_mission(persisted_mission)
+    elif state:
+        mission = state.mission
+    else:
         mission = runtime.get_mission(mission_id)
         if not mission:
             raise HTTPException(status_code=404, detail=f"Mission {mission_id} not found")
-    else:
-        mission = state.mission
 
     # Get findings and assets from state manager
-    findings = state_manager.get_findings(mission_id) if state else []
-    assets = state_manager.get_assets(mission_id) if state else []
+    persisted_findings = await runtime.get_authoritative_findings(mission_id=mission_id)
+    raw_findings = (
+        persisted_findings
+        if persisted_findings is not None
+        else (state_manager.get_findings(mission_id) if state else [])
+    )
+    findings = [_as_domain_finding(finding) for finding in raw_findings]
+    persisted_assets = await runtime.get_authoritative_assets(mission_id)
+    assets = (
+        persisted_assets
+        if persisted_assets is not None
+        else (state_manager.get_assets(mission_id) if state else [])
+    )
 
     try:
         report_type_enum = ReportType(report_type)
@@ -129,7 +141,32 @@ async def get_report(
 
     if output_format == ReportFormat.HTML:
         html = generator.render_html(report, findings, assets)
-        return {"format": "html", "content": html, "title": report.title}
+        return {
+            "format": "html",
+            "content": html,
+            "title": report.title,
+            "risk_score": mission.overall_risk_score,
+            "risk_score_scale": 100,
+        }
+
+    overall_risk = mission.overall_risk_score
+    if overall_risk is None:
+        overall_risk = max(
+            (finding.risk_score for finding in findings if finding.risk_score is not None),
+            default=None,
+        )
+    if overall_risk is None:
+        overall_level = "none"
+    elif overall_risk >= 85:
+        overall_level = "critical"
+    elif overall_risk >= 70:
+        overall_level = "high"
+    elif overall_risk >= 40:
+        overall_level = "medium"
+    elif overall_risk > 0:
+        overall_level = "low"
+    else:
+        overall_level = "none"
 
     return {
         "id": str(report.id),
@@ -140,8 +177,9 @@ async def get_report(
         "mission_name": report.mission_name,
         "executive_summary": report.executive_summary,
         "findings_summary": report.findings_summary,
-        "risk_score": report.risk_score,
-        "risk_level": report.risk_level,
+        "risk_score": overall_risk,
+        "risk_score_scale": 100,
+        "risk_level": overall_level,
         "critical_recommendations": report.critical_recommendations,
         "high_recommendations": report.high_recommendations,
         "medium_recommendations": report.medium_recommendations,
@@ -162,6 +200,7 @@ async def get_report(
 
 
 def _finding_to_response(finding: Any) -> Dict[str, Any]:
+    metadata = getattr(finding, "metadata", {}) or {}
     return {
         "id": str(finding.id),
         "title": finding.title,
@@ -170,8 +209,53 @@ def _finding_to_response(finding: Any) -> Dict[str, Any]:
         "cve_id": finding.cve_id,
         "cvss_score": finding.cvss_score,
         "risk_score": finding.risk_score,
+        "risk_level": finding.risk_level,
+        "risk_factors": finding.risk_factors,
+        "risk_explanation": finding.risk_explanation,
+        "intelligence_status": metadata.get("intelligence_status", "not_processed"),
         "remediation_steps": finding.remediation_steps,
     }
+
+
+def _as_domain_finding(finding: Any) -> Finding:
+    """Hydrate a persisted ORM finding for the domain report generator."""
+    if isinstance(finding, Finding):
+        return finding
+    data: Dict[str, Any] = {}
+    for field_name in Finding.model_fields:
+        source_name = "metadata_" if field_name == "metadata" else field_name
+        if hasattr(finding, source_name):
+            data[field_name] = getattr(finding, source_name)
+    risk_v2 = data.get("metadata", {}).get("risk_v2", {})
+    data["risk_level"] = risk_v2.get("level", "none")
+    data["risk_factors"] = risk_v2.get("factors", [])
+    data["risk_explanation"] = risk_v2.get("explanation")
+    data["risk_calculation_metadata"] = {
+        "risk_id": risk_v2.get("id"),
+        "calculated_at": risk_v2.get("calculated_at"),
+        "calculated_by": risk_v2.get("calculated_by"),
+        "engine": "OracleRiskScoreV2" if risk_v2 else None,
+    }
+    return Finding.model_validate(data)
+
+
+def _as_domain_mission(mission: Any) -> Mission:
+    """Hydrate a persisted ORM mission for restart-safe report generation."""
+    if isinstance(mission, Mission):
+        return mission
+    data: Dict[str, Any] = {}
+    for field_name in Mission.model_fields:
+        source_name = "metadata_" if field_name == "metadata" else field_name
+        if hasattr(mission, source_name):
+            data[field_name] = getattr(mission, source_name)
+    data["target"] = MissionTarget(
+        domains=list(mission.target_domains or []),
+        ip_ranges=list(mission.target_ip_ranges or []),
+        urls=list(mission.target_urls or []),
+        api_endpoints=list(mission.target_api_endpoints or []),
+        excluded_targets=list(mission.target_excluded or []),
+    )
+    return Mission.model_validate(data)
 
 
 def _asset_to_response(asset: Any) -> Dict[str, Any]:

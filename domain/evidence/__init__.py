@@ -114,6 +114,7 @@ class Evidence(BaseModel):
     asset_id: Optional[UUID] = None
     asset_value: str = ""
     mission_id: Optional[UUID] = None
+    task_id: Optional[UUID] = None
     project_id: Optional[UUID] = None
     raw_data: Dict[str, Any] = Field(default_factory=dict)
     normalized_data: Dict[str, Any] = Field(default_factory=dict)

@@ -17,6 +17,7 @@ from runtime.state_manager import StateManager
 from runtime.policy_engine import PolicyEngine
 from runtime.resource_manager import ResourceManager
 from runtime.validator import Validator
+from runtime.execution_result import IngestionResult, TaskExecutionResult
 
 __all__ = [
     "EventBus",
@@ -29,4 +30,6 @@ __all__ = [
     "PolicyEngine",
     "ResourceManager",
     "Validator",
+    "IngestionResult",
+    "TaskExecutionResult",
 ]

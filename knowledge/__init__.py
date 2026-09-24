@@ -32,6 +32,7 @@ from core.logging import get_logger, get_mission_logger
 from core.telemetry import telemetry
 
 logger = get_logger(__name__)
+mission_logger = get_mission_logger()
 
 
 class KnowledgeGraphService:
@@ -143,7 +144,7 @@ class KnowledgeGraphService:
                 )
             duration = mission_logger.stop_timer(f"graph_update_status_{mid}") or 0.0
             telemetry.record_histogram("knowledge.graph.write_latency", duration, {"operation": "update_mission_status"})
-        except Exception as e:
+        except Exception:
             mission_logger.stop_timer(f"graph_update_status_{mid}")
             raise
 
@@ -205,25 +206,74 @@ class KnowledgeGraphService:
                 )
 
     async def create_finding_node(
-        self, finding_id: UUID, asset_id: UUID, title: str, severity: str,
+        self, finding_id: UUID, asset_id: Optional[UUID], title: str, severity: str,
         cve_id: str = "", mitre_technique: str = "",
+        mission_id: Optional[UUID] = None, evidence_ids: Optional[List[UUID]] = None,
+        cwe_id: str = "", risk_score: Optional[float] = None,
+        risk_level: str = "none", risk_id: str = "",
     ) -> None:
-        """Create a finding node connected to an asset."""
+        """Idempotently project a finding and its authoritative relationships."""
         if not self.is_available:
             return
         async with self.session() as session:
             await session.run(
-                "MERGE (f:Finding {id: $id}) SET f.title = $title, f.severity = $severity, f.created_at = datetime()",
+                """
+                MERGE (f:Finding {id: $id})
+                SET f.title = $title, f.severity = $severity,
+                    f.asset_id = $asset_id, f.cve_id = $cve_id,
+                    f.cwe_id = $cwe_id, f.risk_id = $risk_id,
+                    f.updated_at = datetime()
+                """,
                 id=str(finding_id), title=title, severity=severity,
+                asset_id=str(asset_id) if asset_id else "",
+                cve_id=cve_id, cwe_id=cwe_id, risk_id=risk_id,
             )
-            await session.run(
-                "MATCH (a:Asset {id: $aid}) MATCH (f:Finding {id: $fid}) MERGE (a)-[r:HAS_FINDING]->(f) SET r.discovered_at = datetime()",
-                aid=str(asset_id), fid=str(finding_id),
-            )
+            if asset_id:
+                await session.run(
+                    """
+                    MATCH (a:Asset {id: $aid}) MATCH (f:Finding {id: $fid})
+                    MERGE (a)-[:HAS_FINDING]->(f)
+                    MERGE (f)-[:AFFECTS]->(a)
+                    """,
+                    aid=str(asset_id), fid=str(finding_id),
+                )
+            if mission_id:
+                await session.run(
+                    "MATCH (m:Mission {id: $mid}) MATCH (f:Finding {id: $fid}) MERGE (m)-[:HAS_FINDING]->(f)",
+                    mid=str(mission_id), fid=str(finding_id),
+                )
+            for evidence_id in evidence_ids or []:
+                await session.run(
+                    "MATCH (f:Finding {id: $fid}) MATCH (e:Evidence {id: $eid}) MERGE (f)-[:SUPPORTED_BY]->(e)",
+                    fid=str(finding_id), eid=str(evidence_id),
+                )
             if cve_id:
                 await session.run(
-                    "MATCH (f:Finding {id: $fid}) MERGE (c:CVE {id: $cve}) MERGE (f)-[r:RELATES_TO]->(c) SET r.mapped_at = datetime()",
+                    """
+                    MATCH (f:Finding {id: $fid}) MERGE (c:CVE {id: $cve})
+                    MERGE (f)-[:REFERENCES]->(c)
+                    """,
                     fid=str(finding_id), cve=cve_id,
+                )
+            if cwe_id:
+                await session.run(
+                    """
+                    MATCH (f:Finding {id: $fid}) MERGE (c:CWE {id: $cwe})
+                    MERGE (f)-[:CLASSIFIED_AS]->(c)
+                    """,
+                    fid=str(finding_id), cwe=cwe_id,
+                )
+            if risk_score is not None:
+                await session.run(
+                    """
+                    MATCH (f:Finding {id: $fid})
+                    MERGE (r:Risk {finding_id: $fid})
+                    SET r.id = $rid, r.score = $score, r.level = $level,
+                        r.calculated_by = 'risk_engine_v2', r.updated_at = datetime()
+                    MERGE (f)-[:HAS_RISK]->(r)
+                    """,
+                    fid=str(finding_id), rid=risk_id or f"risk:{finding_id}",
+                    score=risk_score, level=risk_level,
                 )
             if mitre_technique:
                 await session.run(
@@ -279,11 +329,14 @@ class KnowledgeGraphService:
                 OPTIONAL MATCH (a)-[:HAS_PORT]->(p:Port)
                 OPTIONAL MATCH (p)-[:RUNS]->(s:Service)
                 OPTIONAL MATCH (a)-[:HAS_FINDING]->(f:Finding)
-                OPTIONAL MATCH (f)-[:RELATES_TO]->(c:CVE)
+                OPTIONAL MATCH (f)-[:REFERENCES]->(c:CVE)
+                OPTIONAL MATCH (f)-[:CLASSIFIED_AS]->(w:CWE)
+                OPTIONAL MATCH (f)-[:HAS_RISK]->(r:Risk)
                 OPTIONAL MATCH (f)-[:MAPS_TO]->(t:MITRE_Technique)
                 RETURN m, collect(DISTINCT a) as assets, collect(DISTINCT p) as ports,
                        collect(DISTINCT s) as services, collect(DISTINCT f) as findings,
-                       collect(DISTINCT c) as cves, collect(DISTINCT t) as techniques
+                       collect(DISTINCT c) as cves, collect(DISTINCT w) as cwes,
+                       collect(DISTINCT r) as risks, collect(DISTINCT t) as techniques
                 """,
                 mid=str(mission_id),
             )
@@ -305,8 +358,20 @@ class KnowledgeGraphService:
                     nodes.append({"id": svc.get("name"), "label": svc.get("name"), "type": "service", "properties": dict(svc.items())})
                 for finding in record.get("findings", []):
                     nodes.append({"id": finding.get("id"), "label": finding.get("title"), "type": "finding", "properties": dict(finding.items())})
+                    if finding.get("asset_id"):
+                        relationships.append({"source": finding.get("id"), "target": finding.get("asset_id"), "type": "AFFECTS"})
+                    if finding.get("cve_id"):
+                        relationships.append({"source": finding.get("id"), "target": finding.get("cve_id"), "type": "REFERENCES"})
+                    if finding.get("cwe_id"):
+                        relationships.append({"source": finding.get("id"), "target": finding.get("cwe_id"), "type": "CLASSIFIED_AS"})
+                    if finding.get("risk_id"):
+                        relationships.append({"source": finding.get("id"), "target": finding.get("risk_id"), "type": "HAS_RISK"})
                 for cve in record.get("cves", []):
                     nodes.append({"id": cve.get("id"), "label": cve.get("id"), "type": "cve", "properties": dict(cve.items())})
+                for cwe in record.get("cwes", []):
+                    nodes.append({"id": cwe.get("id"), "label": cwe.get("id"), "type": "cwe", "properties": dict(cwe.items())})
+                for risk in record.get("risks", []):
+                    nodes.append({"id": risk.get("id") or f"risk:{risk.get('finding_id')}", "label": f"Risk {risk.get('score')}", "type": "risk", "properties": dict(risk.items())})
                 for tech in record.get("techniques", []):
                     nodes.append({"id": tech.get("id"), "label": tech.get("id"), "type": "mitre_technique", "properties": dict(tech.items())})
             return {"nodes": nodes, "relationships": relationships}

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from domain.intelligence import EnrichedFinding, ThreatIntelligence
+from domain.intelligence import EnrichedFinding
 from domain.scoring import (
     OracleRiskScoreV2,
     RiskExplanation,
@@ -150,7 +150,7 @@ class RiskEngineV2:
 
         cvss_score = None
         epss_score = None
-        in_kev = False
+        in_kev: Optional[bool] = None
         exploit_maturity = "unknown"
 
         if ti:
@@ -160,6 +160,8 @@ class RiskEngineV2:
                 epss_score = ti.epss.epss_score
             if ti.kev:
                 in_kev = True
+            elif ti.provider_status.get("kev") == "not_found":
+                in_kev = False
 
         exploit_maturity = enriched.metadata.get("exploit_maturity", "unknown") or "unknown"
 
@@ -187,7 +189,7 @@ class RiskEngineV2:
         asset_criticality: str = "unknown",
         business_importance: str = "medium",
         exploit_maturity: str = "unknown",
-        in_kev: bool = False,
+        in_kev: Optional[bool] = False,
         evidence_count: int = 0,
         finding_id: Optional[Any] = None,
         asset_id: Optional[Any] = None,
@@ -204,7 +206,7 @@ class RiskEngineV2:
             asset_criticality: Criticality of the asset
             business_importance: Business importance of the function
             exploit_maturity: Exploit maturity level
-            in_kev: Whether CVE is in CISA KEV catalog
+            in_kev: Whether CVE is in CISA KEV; ``None`` means unavailable
             evidence_count: Number of evidence items
             finding_id, asset_id, mission_id: Context IDs
 
@@ -295,17 +297,21 @@ class RiskEngineV2:
         ))
 
         # 8. KEV (CISA Known Exploited Vulnerabilities)
-        kev_factor = 1.0 if in_kev else 0.0
+        kev_factor = 1.0 if in_kev is True else 0.0
         factors.append(RiskFactorV2(
             name="kev",
             value=kev_factor,
             weight=self.weights["kev"],
             evidence=(
                 "CVE is listed in CISA's Known Exploited Vulnerabilities catalog"
-                if in_kev
-                else "CVE is not in CISA KEV catalog"
+                if in_kev is True
+                else (
+                    "CVE is not in CISA KEV catalog"
+                    if in_kev is False
+                    else "No KEV data available — defaulting to 0.0"
+                )
             ),
-            source="cisa_kev",
+            source="cisa_kev" if in_kev is not None else "default",
         ))
 
         # 9. Evidence count (reserved, weight = 0)

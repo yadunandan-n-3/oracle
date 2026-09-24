@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from core.events import EventType, OracleEvent
@@ -27,8 +27,9 @@ from domain.asset import Asset
 from domain.evidence import Evidence
 from domain.finding import Finding
 from domain.mission import Mission, MissionStatus
+from domain.scoring import FindingRevision, VersionedFinding
 from runtime.event_bus import get_event_bus
-from runtime.planner import Plan, Task, TaskStatus
+from runtime.planner import Plan, Task
 
 logger = get_logger(__name__)
 
@@ -54,6 +55,7 @@ class MissionState:
     assets: Dict[str, Asset] = field(default_factory=dict)  # keyed by value (IP, domain)
     evidence: Dict[UUID, Evidence] = field(default_factory=dict)
     findings: Dict[UUID, Finding] = field(default_factory=dict)
+    finding_versions: Dict[UUID, VersionedFinding] = field(default_factory=dict)
 
     # Context for agents
     context: Dict[str, Any] = field(default_factory=dict)
@@ -202,7 +204,7 @@ class StateManager:
         self,
         mission_id: UUID,
         asset: Asset,
-    ) -> None:
+    ) -> Asset:
         """Add or update an asset in the mission state."""
         state = self._states.get(mission_id)
         if state:
@@ -210,14 +212,26 @@ class StateManager:
             if key in state.assets:
                 # Update existing
                 existing = state.assets[key]
-                existing.open_ports = list(set(existing.open_ports + asset.open_ports))
-                existing.services = list(set(existing.services + asset.services))
+                existing.label = asset.label or existing.label
+                existing.description = asset.description or existing.description
+                existing.ip_addresses = sorted(set(existing.ip_addresses + asset.ip_addresses))
+                existing.hostnames = sorted(set(existing.hostnames + asset.hostnames))
+                existing.domains = sorted(set(existing.domains + asset.domains))
+                existing.open_ports = sorted(set(existing.open_ports + asset.open_ports))
+                existing.services = sorted(set(existing.services + asset.services))
                 existing.technologies.update(asset.technologies)
+                existing.tags = sorted(set(existing.tags + asset.tags))
+                existing.os = asset.os or existing.os
+                existing.os_version = asset.os_version or existing.os_version
+                existing.metadata.update(asset.metadata)
                 existing.last_seen_at = datetime.now(timezone.utc)
             else:
                 state.assets[key] = asset
 
+            self._sync_mission_counters(state)
             state.last_updated = datetime.now(timezone.utc)
+            return state.assets[key]
+        return asset
 
     def get_assets(
         self,
@@ -250,6 +264,7 @@ class StateManager:
         state = self._states.get(mission_id)
         if state:
             state.evidence[evidence.id] = evidence
+            self._sync_mission_counters(state)
             state.last_updated = datetime.now(timezone.utc)
 
             # Publish evidence event
@@ -292,19 +307,39 @@ class StateManager:
         """Add a finding to the mission state."""
         state = self._states.get(mission_id)
         if state:
-            state.findings[finding.id] = finding
-            state.last_updated = datetime.now(timezone.utc)
+            previous = state.findings.get(finding.id)
+            changed_fields: List[str] = []
+            if previous:
+                for field_name in (
+                    "title", "description", "severity", "status", "asset_id",
+                    "evidence_ids", "cve_id", "cwe_id", "confidence",
+                    "risk_score", "risk_level", "risk_factors",
+                ):
+                    if getattr(previous, field_name) != getattr(finding, field_name):
+                        changed_fields.append(field_name)
+                if not changed_fields:
+                    return
 
-            # Update mission counters
-            if finding.severity.value == "critical":
-                state.mission.critical_findings += 1
-            elif finding.severity.value == "high":
-                state.mission.high_findings += 1
-            elif finding.severity.value == "medium":
-                state.mission.medium_findings += 1
-            elif finding.severity.value == "low":
-                state.mission.low_findings += 1
-            state.mission.total_findings += 1
+            state.findings[finding.id] = finding
+            versioned = state.finding_versions.setdefault(
+                finding.id,
+                VersionedFinding(finding_id=finding.id),
+            )
+            revision = FindingRevision(
+                finding_id=finding.id,
+                version=(versioned.current_version + 1 if versioned.revisions else 1),
+                status=finding.status.value,
+                severity=finding.severity.value,
+                risk_score_v2=finding.risk_score,
+                risk_level=finding.risk_level,
+                evidence_ids=list(finding.evidence_ids),
+                changed_fields=changed_fields,
+                change_reason=("Finding updated from correlated evidence" if previous else "Finding created from correlated evidence"),
+                captured_by=finding.discovered_by,
+            )
+            versioned.add_revision(revision)
+            self._sync_mission_counters(state)
+            state.last_updated = datetime.now(timezone.utc)
 
     def get_findings(
         self,
@@ -323,6 +358,23 @@ class StateManager:
         if status:
             results = [f for f in results if f.status.value == status]
         return results
+
+    @staticmethod
+    def _sync_mission_counters(state: MissionState) -> None:
+        """Derive cached counters from the records in mission state."""
+        mission = state.mission
+        findings = list(state.findings.values())
+        mission.total_assets_discovered = len(state.assets)
+        mission.total_evidence = len(state.evidence)
+        mission.total_findings = len(findings)
+        mission.critical_findings = sum(f.severity.value == "critical" for f in findings)
+        mission.high_findings = sum(f.severity.value == "high" for f in findings)
+        mission.medium_findings = sum(f.severity.value == "medium" for f in findings)
+        mission.low_findings = sum(f.severity.value == "low" for f in findings)
+        mission.overall_risk_score = max(
+            (f.risk_score for f in findings if f.risk_score is not None),
+            default=None,
+        )
 
     # ─── Context Management ────────────────────────────────────────────────
 

@@ -87,7 +87,7 @@ class SecurityIntelligenceService:
             title=finding.title,
             description=finding.description,
             severity=finding.severity.value if hasattr(finding.severity, "value") else str(finding.severity),
-            confidence=finding.metadata.get("confidence", 0.7) if finding.metadata else 0.7,
+            confidence=finding.confidence,
             asset_value=finding.asset_value,
             asset_type=finding.asset_type,
             evidence_ids=finding.evidence_ids,
@@ -109,11 +109,12 @@ class SecurityIntelligenceService:
             self._apply_threat_intelligence(enriched, threat_intel)
 
         # Apply or build asset intelligence
-        if asset_intel:
-            enriched.asset_criticality = asset_intel.risk_level
-            enriched.business_importance = "medium"  # Configurable
-        else:
+        if asset_intel is None:
             asset_intel = await self._build_asset_intelligence(finding, evidence_list)
+        enriched.asset_criticality = asset_intel.risk_level
+        enriched.business_importance = str(
+            finding.metadata.get("business_importance", "medium")
+        )
 
         # Calculate CVSS from threat intel if available
         if threat_intel and threat_intel.cve and threat_intel.cve.cvss_score is not None:
@@ -250,8 +251,9 @@ class SecurityIntelligenceService:
             if finding.id not in asset_intel.finding_ids:
                 asset_intel.finding_ids.append(finding.id)
             asset_intel.finding_count = len(asset_intel.finding_ids)
-            if finding.severity in ("critical", "high"):
-                if finding.severity == "critical":
+            severity = finding.severity.value if hasattr(finding.severity, "value") else str(finding.severity)
+            if severity in ("critical", "high"):
+                if severity == "critical":
                     asset_intel.critical_finding_count += 1
                 else:
                     asset_intel.high_finding_count += 1
@@ -309,8 +311,8 @@ class SecurityIntelligenceService:
             internet_exposed=finding.internet_exposed,
             finding_ids=[finding.id],
             finding_count=1,
-            critical_finding_count=1 if finding.severity == "critical" else 0,
-            high_finding_count=1 if finding.severity == "high" else 0,
+            critical_finding_count=1 if finding.severity.value == "critical" else 0,
+            high_finding_count=1 if finding.severity.value == "high" else 0,
             cve_ids=[finding.cve_id] if finding.cve_id else [],
             tags=finding.tags,
         )

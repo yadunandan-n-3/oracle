@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from domain.correlation import CorrelationResult, CorrelationRule, CorrelationType
 from domain.evidence import Evidence
@@ -63,7 +64,7 @@ class ApacheCorrelationRule(CorrelationRule):
         for evidence in evidence_list:
             if not isinstance(evidence, Evidence):
                 continue
-            asset = evidence.asset_value
+            asset = self._asset_key(evidence.asset_value)
             if asset not in evidence_by_asset:
                 evidence_by_asset[asset] = []
             evidence_by_asset[asset].append(evidence)
@@ -77,12 +78,6 @@ class ApacheCorrelationRule(CorrelationRule):
             matched_cves = self._find_matching_cves(items, apache_version)
             if not matched_cves:
                 continue
-
-            # Build the correlation result
-            matched_evidence_ids = [
-                ev.id for ev in items
-                if self._is_apache_evidence(ev) or self._is_cve_matching(ev, matched_cves)
-            ]
 
             # Determine the host/IP from the asset value
             ip, port, protocol = self._parse_asset_value(asset_value)
@@ -107,6 +102,14 @@ class ApacheCorrelationRule(CorrelationRule):
             ))
 
         return results
+
+    @staticmethod
+    def _asset_key(asset_value: str) -> str:
+        """Group URL and host:port observations for the same host."""
+        if "://" in asset_value:
+            return urlsplit(asset_value).hostname or asset_value
+        match = re.match(r"([^:/]+)", asset_value)
+        return match.group(1) if match else asset_value
 
     def _find_apache_version(self, evidence_list: List[Evidence]) -> Optional[str]:
         """Find Apache HTTP Server version from evidence."""
@@ -160,14 +163,11 @@ class ApacheCorrelationRule(CorrelationRule):
                     if cve not in discovered_cves:
                         discovered_cves.append(cve)
 
-        # Return intersection of known CVEs for this version + discovered CVEs
-        # If no discovered CVEs, return the known ones anyway
+        # A version match alone is not proof of a vulnerability. Only return
+        # CVEs that were actually observed by vulnerability evidence.
         if discovered_cves:
-            matching = [c for c in discovered_cves if c in known_cves]
-            if matching:
-                return matching
-
-        return known_cves
+            return [c for c in discovered_cves if c in known_cves]
+        return []
 
     def _is_apache_evidence(self, evidence: Evidence) -> bool:
         """Check if evidence relates to Apache."""

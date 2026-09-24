@@ -40,21 +40,22 @@ async def list_findings(
     """List findings with optional filtering, sorting, and pagination."""
     state_manager = runtime.state_manager
 
-    all_findings = []
-    mission_ids = state_manager.get_mission_ids()
-
-    if mission_id:
-        target_ids = [mission_id]
+    persisted = await runtime.get_authoritative_findings(
+        mission_id=mission_id,
+        severity=severity,
+        status=status,
+    )
+    if persisted is not None:
+        all_findings = persisted
     else:
-        target_ids = mission_ids
-
-    for mid in target_ids:
-        findings = state_manager.get_findings(
-            mid,
-            severity=severity,
-            status=status,
-        )
-        all_findings.extend(findings)
+        all_findings = []
+        target_ids = [mission_id] if mission_id else state_manager.get_mission_ids()
+        for mid in target_ids:
+            all_findings.extend(state_manager.get_findings(
+                mid,
+                severity=severity,
+                status=status,
+            ))
 
     if asset_id is not None:
         all_findings = [finding for finding in all_findings if finding.asset_id == asset_id]
@@ -114,6 +115,10 @@ async def get_finding(
     runtime: OracleRuntime = Depends(get_runtime),
 ) -> Dict[str, Any]:
     """Get a specific finding by ID."""
+    persisted = await runtime.get_authoritative_finding(finding_id)
+    if persisted is not None:
+        return _finding_to_response(persisted)
+
     state_manager = runtime.state_manager
 
     # Search across all active missions
@@ -190,6 +195,26 @@ async def get_findings_summary(
 
 def _finding_to_response(finding: Any) -> Dict[str, Any]:
     """Convert a Finding domain model to API response."""
+    metadata = getattr(finding, "metadata_", None)
+    if metadata is None:
+        metadata = getattr(finding, "metadata", {}) or {}
+    risk_v2 = metadata.get("risk_v2", {})
+    threat_intelligence = metadata.get("threat_intelligence", {})
+    risk_level = getattr(finding, "risk_level", None) or risk_v2.get("level", "none")
+    risk_factors = getattr(finding, "risk_factors", None) or risk_v2.get("factors", [])
+    risk_explanation = (
+        getattr(finding, "risk_explanation", None)
+        or risk_v2.get("explanation")
+    )
+    calculation = (
+        getattr(finding, "risk_calculation_metadata", None)
+        or {
+            "risk_id": risk_v2.get("id"),
+            "calculated_at": risk_v2.get("calculated_at"),
+            "calculated_by": risk_v2.get("calculated_by"),
+            "engine": "OracleRiskScoreV2" if risk_v2 else None,
+        }
+    )
     return {
         "id": str(finding.id),
         "title": finding.title,
@@ -214,8 +239,14 @@ def _finding_to_response(finding: Any) -> Dict[str, Any]:
         "internet_exposed": finding.internet_exposed,
         "authentication_required": finding.authentication_required,
         "risk_score": finding.risk_score,
+        "risk_level": risk_level,
+        "risk_factors": risk_factors,
+        "risk_explanation": risk_explanation,
+        "risk_calculation_metadata": calculation,
+        "intelligence_status": metadata.get("intelligence_status", "not_processed"),
+        "threat_intelligence": threat_intelligence,
         "confidence": getattr(finding, "confidence", None),
-        "evidence_ids": [str(eid) for eid in finding.evidence_ids],
+        "evidence_ids": [str(eid) for eid in (finding.evidence_ids or [])],
         "mission_id": str(finding.mission_id) if finding.mission_id else None,
         "tags": finding.tags,
         "discovered_at": finding.discovered_at.isoformat() if hasattr(finding, 'discovered_at') else None,

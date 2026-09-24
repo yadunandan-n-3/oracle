@@ -27,29 +27,44 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-from uuid import UUID
+from typing import Any, AsyncIterator, Dict, List, Optional
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from core.config import settings
 from core.events import EventType, OracleEvent
+from core.exceptions import IntegrationError, InvalidStateError
 from core.logging import get_logger, get_mission_logger, setup_logging
+from core.resilience.degraded_mode import DependencyStatus, get_degraded_mode_manager
 from core.telemetry import telemetry
 from core.tool_manager import ToolManager, get_tool_manager
 from domain.asset import Asset
-from domain.evidence import Evidence as EvidenceDomain
+from domain.correlation import CorrelationResult, EvidenceCorrelator
+from domain.correlation.rules import (
+    ApacheCorrelationRule,
+    GenericTechCveCorrelationRule,
+    HttpServiceCorrelationRule,
+    PortServiceCorrelationRule,
+    SSHCveCorrelationRule,
+)
+from domain.evidence import Evidence as EvidenceDomain, EvidenceType
 from domain.evidence import from_agent_evidence
+from domain.finding import Finding, FindingSeverity
+from domain.intelligence.pipeline import FindingIntelligencePipeline
 from domain.mission import Mission, MissionStatus, MissionTarget, MissionType
 from knowledge import get_knowledge_graph, KnowledgeGraphService
 from runtime.event_bus import EventBus, get_event_bus
+from runtime.execution_result import IngestionResult, TaskExecutionResult
+from runtime.ingestion import asset_from_evidence, coalesce_assets, merge_assets
 from runtime.mission_manager import MissionManager
-from runtime.planner import Planner, Plan, Task
+from runtime.planner import Planner, Task
 from runtime.policy_engine import PolicyEngine
 from runtime.resource_manager import ResourceManager, ResourceQuota
 from runtime.scheduler import Scheduler
 from runtime.state_manager import StateManager
 from runtime.validator import Validator
-from runtime.workflow import WorkflowEngine, WorkflowResult, WorkflowStatus
+from runtime.workflow import WorkflowEngine, WorkflowResult
 from tools.nmap import NmapPlugin
 from tools.nuclei import NucleiPlugin
 
@@ -84,8 +99,8 @@ class OracleRuntime:
 
         # Persistence
         self.mission_service: Optional[any] = None
-        self._db_session = None
-        self._db_session_gen = None
+        self._database_available = False
+        self._degraded_mode = get_degraded_mode_manager()
 
         # Knowledge Graph
         self.knowledge_graph: KnowledgeGraphService = get_knowledge_graph()
@@ -96,6 +111,15 @@ class OracleRuntime:
         # Registry
         self._registered_handlers: Dict[str, Any] = {}
         self._discovery_agents: Dict[UUID, Any] = {}
+        self._ingestion_locks: Dict[UUID, asyncio.Lock] = {}
+        self._correlation_rules = [
+            ApacheCorrelationRule(),
+            SSHCveCorrelationRule(),
+            HttpServiceCorrelationRule(),
+            GenericTechCveCorrelationRule(),
+            PortServiceCorrelationRule(),
+        ]
+        self.intelligence_pipeline = FindingIntelligencePipeline()
         self._started_at: Optional[datetime] = None
 
     # ─── Lifecycle ────────────────────────────────────────────────────────
@@ -123,34 +147,36 @@ class OracleRuntime:
         # Initialize database
         try:
             async def _init_database() -> None:
-                from backend.database import init_database, get_session
+                from backend.database import init_database
                 await init_database()
-                from backend.services import MissionService
-                session_gen = get_session()
-                session = await anext(session_gen)
-                self.mission_service = MissionService(session)
-                self._db_session = session
-                self._db_session_gen = session_gen
 
             await asyncio.wait_for(_init_database(), timeout=2.0)
+            self._database_available = True
+            self._degraded_mode.update_status("postgresql", DependencyStatus.HEALTHY)
             logger.info("runtime.database_initialized")
         except asyncio.TimeoutError:
             logger.warning("runtime.database_init_timeout")
-            self.mission_service = None
+            self._database_available = False
+            self._degraded_mode.update_status("postgresql", DependencyStatus.UNAVAILABLE)
         except Exception as e:
             logger.warning("runtime.database_unavailable", error=str(e))
-            self.mission_service = None
+            self._database_available = False
+            self._degraded_mode.update_status("postgresql", DependencyStatus.UNAVAILABLE)
 
         # Initialize knowledge graph
         try:
             await asyncio.wait_for(self.knowledge_graph.initialize(), timeout=2.0)
             if self.knowledge_graph.is_available:
+                self._degraded_mode.update_status("neo4j", DependencyStatus.HEALTHY)
                 logger.info("runtime.knowledge_graph_initialized")
             else:
+                self._degraded_mode.update_status("neo4j", DependencyStatus.UNAVAILABLE)
                 logger.warning("runtime.knowledge_graph_unavailable")
         except asyncio.TimeoutError:
+            self._degraded_mode.update_status("neo4j", DependencyStatus.UNAVAILABLE)
             logger.warning("runtime.knowledge_graph_init_timeout")
         except Exception as e:
+            self._degraded_mode.update_status("neo4j", DependencyStatus.UNAVAILABLE)
             logger.warning("runtime.knowledge_graph_init_failed", error=str(e))
 
         await self._event_bus.publish(OracleEvent(
@@ -179,6 +205,8 @@ class OracleRuntime:
 
         if self.knowledge_graph:
             await self.knowledge_graph.close()
+
+        await self.intelligence_pipeline.close()
 
         try:
             from backend.database import close_database
@@ -209,6 +237,7 @@ class OracleRuntime:
                 "knowledge_graph": kg_health,
                 "active_missions": len(self.state_manager.get_active_missions()),
                 "active_workflows": len(self.workflow_engine.get_active_workflows()),
+                "dependencies": self._degraded_mode.get_health_summary(),
             },
         }
 
@@ -236,11 +265,16 @@ class OracleRuntime:
             str(mission.id), ResourceQuota(max_concurrent_tools=5, max_duration_minutes=120),
         )
 
-        if self.mission_service:
-            try:
-                await self.mission_service.create_mission(mission)
-            except Exception as e:
-                logger.error("runtime.persist_mission_failed", error=str(e))
+        try:
+            async with self._persistence_scope() as service:
+                if service:
+                    await service.create_mission(mission)
+                else:
+                    self._mark_persistence_degraded(mission)
+        except Exception as e:
+            self._degraded_mode.update_status("postgresql", DependencyStatus.UNAVAILABLE)
+            self._mark_persistence_degraded(mission, str(e))
+            logger.error("runtime.persist_mission_failed", error=str(e))
 
         if self.knowledge_graph.is_available:
             try:
@@ -315,11 +349,10 @@ class OracleRuntime:
             mission_logger.log_mission_failed(mission_id_str, str(e), ms)
             await self.mission_manager.fail_mission(mission_id, str(e))
             await self._persist_mission_status(mission_id, MissionStatus.FAILED)
+            self._discovery_agents.pop(mission_id, None)
             raise
 
         if not result.succeeded:
-            if result.status == WorkflowStatus.CANCELLED:
-                return result
             error = result.error or f"Workflow ended with status {result.status.value}"
             ms = mission_logger.elapsed_ms("mission_total") or 0.0
             mission_logger.log_mission_failed(mission_id_str, error, ms)
@@ -384,40 +417,548 @@ class OracleRuntime:
         self.workflow_engine.register_handler(capability, handler)
         logger.info("runtime.handler_registered", capability=capability)
 
-    # ─── Evidence Pipeline ───────────────────────────────────────────────
+    # ─── Asset / Evidence / Finding Production Pipeline ─────────────────
 
-    async def process_evidence(self, evidence: EvidenceDomain, mission_id: UUID) -> None:
-        """Process evidence through the pipeline: validate -> persist -> graph."""
-        mission_id_str = str(mission_id)
-        mission_logger.start_timer("evidence_pipeline")
+    async def process_execution_result(
+        self,
+        result: TaskExecutionResult,
+    ) -> IngestionResult:
+        """Validate, persist, project, correlate, and publish one task result."""
+        if not result.success:
+            raise IntegrationError(
+                message="Cannot ingest an unsuccessful task result",
+                service="execution",
+                details={"task_id": str(result.task_id), "errors": result.errors},
+            )
 
-        validated = await self.validator.validate_evidence(evidence)
-
-        if self.mission_service:
-            try:
-                await self.mission_service.create_evidence(mission_id, validated)
-            except Exception as e:
-                logger.error("runtime.persist_evidence_failed", error=str(e))
-
-        if self.knowledge_graph.is_available:
-            try:
-                await self.knowledge_graph.create_evidence_node(
-                    evidence_id=validated.id, mission_id=mission_id,
-                    asset_id=validated.asset_id,
-                    evidence_type=validated.evidence_type.value if hasattr(validated.evidence_type, 'value') else str(validated.evidence_type),
-                    title=validated.title or "",
-                    confidence=validated.confidence,
+        lock = self._ingestion_locks.setdefault(result.mission_id, asyncio.Lock())
+        async with lock:
+            state = await self.state_manager.get_mission_state(result.mission_id)
+            if state is None:
+                raise InvalidStateError(
+                    message=f"Mission state is not initialized: {result.mission_id}",
+                    current_state="missing",
+                    expected_state="initialized",
                 )
-            except Exception as e:
-                logger.error("runtime.graph_evidence_failed", error=str(e))
 
-        await self.state_manager.add_evidence(mission_id, validated)
+            mission_logger.start_timer(f"ingestion_{result.task_id}")
+            validated_evidence: List[EvidenceDomain] = []
+            derived_assets: List[Asset] = list(result.assets)
 
-        duration_ms = mission_logger.stop_timer("evidence_pipeline") or 0.0
-        mission_logger.log("evidence.processed", mission_id=mission_id_str,
-                           details={"evidence_type": validated.evidence_type.value if hasattr(validated.evidence_type, 'value') else str(validated.evidence_type),
-                                    "confidence": validated.confidence,
-                                    "duration_ms": duration_ms})
+            for evidence in result.evidence:
+                evidence.mission_id = result.mission_id
+                evidence.task_id = result.task_id
+                evidence.source.execution_id = result.task_id
+                evidence.metadata["task_id"] = str(result.task_id)
+                evidence.metadata["capability"] = result.capability
+                source_type = evidence.metadata.get("source_evidence_type")
+                if source_type == "port":
+                    evidence.evidence_type = EvidenceType.OPEN_PORT
+                elif source_type == "service":
+                    evidence.evidence_type = EvidenceType.SERVICE
+
+                validated = await self.validator.validate_evidence(evidence)
+                validated_evidence.append(validated)
+                asset = asset_from_evidence(result.mission_id, validated)
+                if asset:
+                    derived_assets.append(asset)
+
+            assets = coalesce_assets(result.mission_id, derived_assets)
+            assets = self._merge_with_state_assets(result.mission_id, assets)
+
+            for evidence in validated_evidence:
+                observed_asset = asset_from_evidence(result.mission_id, evidence)
+                if observed_asset:
+                    evidence.asset_id = observed_asset.id
+
+            mission_evidence = {
+                evidence.id: evidence for evidence in self.state_manager.get_evidence(result.mission_id)
+            }
+            mission_evidence.update({evidence.id: evidence for evidence in validated_evidence})
+            findings = await self._produce_findings(
+                result.mission_id,
+                list(mission_evidence.values()),
+                [*self.state_manager.get_assets(result.mission_id), *assets],
+            )
+            produced_findings = findings
+
+            # Intelligence is an optional enhancement to the durable P1
+            # finding path. Provider outages are captured on the finding and
+            # never convert real evidence into a failed ingestion.
+            evidence_by_id = {
+                item.id: item for item in mission_evidence.values()
+            }
+            enriched_findings = []
+            risk_scores = []
+            for finding in produced_findings:
+                supporting = [
+                    evidence_by_id[evidence_id]
+                    for evidence_id in finding.evidence_ids
+                    if evidence_id in evidence_by_id
+                ]
+                try:
+                    intelligence = await self.intelligence_pipeline.process(
+                        finding,
+                        supporting,
+                    )
+                    enriched_findings.append(intelligence.enriched_finding)
+                    risk_scores.append(intelligence.risk_score)
+                except Exception as exc:
+                    finding.metadata["intelligence_status"] = "failed"
+                    finding.metadata["intelligence_error"] = str(exc)
+                    logger.warning(
+                        "runtime.finding_intelligence_failed",
+                        finding_id=str(finding.id),
+                        error=str(exc),
+                    )
+
+            projected_assets = {
+                asset.value: asset for asset in self.state_manager.get_assets(result.mission_id)
+            }
+            projected_assets.update({asset.value: asset for asset in assets})
+            projected_findings = {
+                finding.id: finding for finding in self.state_manager.get_findings(result.mission_id)
+            }
+            projected_findings.update({finding.id: finding for finding in produced_findings})
+            counter_values = self._counter_values(
+                projected_assets.values(),
+                mission_evidence.values(),
+                projected_findings.values(),
+            )
+
+            outcome = IngestionResult(
+                mission_id=result.mission_id,
+                task_id=result.task_id,
+                assets=assets,
+                evidence=validated_evidence,
+                findings=produced_findings,
+                enriched_findings=enriched_findings,
+                risk_scores=risk_scores,
+            )
+
+            try:
+                async with self._persistence_scope() as service:
+                    if service:
+                        for asset in assets:
+                            await service.upsert_asset(result.mission_id, asset)
+                        for evidence in validated_evidence:
+                            await service.create_evidence(result.mission_id, evidence)
+                        for finding in produced_findings:
+                            await service.upsert_finding(result.mission_id, finding)
+                        await service.sync_mission_counters(
+                            result.mission_id,
+                            **counter_values,
+                        )
+                        outcome.persisted = True
+                        self._degraded_mode.update_status(
+                            "postgresql", DependencyStatus.HEALTHY
+                        )
+                    else:
+                        self._degraded_mode.update_status(
+                            "postgresql", DependencyStatus.UNAVAILABLE
+                        )
+                        outcome.degraded_dependencies.append("postgresql")
+                        self._mark_persistence_degraded(state.mission)
+            except Exception as exc:
+                result.success = False
+                result.errors.append(str(exc))
+                self._degraded_mode.update_status(
+                    "postgresql", DependencyStatus.UNAVAILABLE
+                )
+                self._mark_persistence_degraded(state.mission, str(exc))
+                logger.error(
+                    "runtime.persistence_failed",
+                    mission_id=str(result.mission_id),
+                    task_id=str(result.task_id),
+                    error=str(exc),
+                )
+                raise IntegrationError(
+                    message=f"PostgreSQL persistence failed: {exc}",
+                    service="postgresql",
+                    details={"mission_id": str(result.mission_id), "task_id": str(result.task_id)},
+                ) from exc
+
+            # State changes occur only after the PostgreSQL transaction has
+            # committed (or after an explicit state-only degraded decision).
+            for asset in assets:
+                await self.state_manager.add_asset(result.mission_id, asset)
+            for evidence in validated_evidence:
+                await self.state_manager.add_evidence(result.mission_id, evidence)
+            for finding in produced_findings:
+                await self.state_manager.add_finding(result.mission_id, finding)
+
+            await self._project_ingestion_to_graph(outcome)
+            result.assets = assets
+            result.evidence = validated_evidence
+            result.metadata["finding_ids"] = [str(finding.id) for finding in produced_findings]
+            result.metadata["persistence"] = "persisted" if outcome.persisted else "degraded"
+
+            duration_ms = mission_logger.stop_timer(f"ingestion_{result.task_id}") or 0.0
+            mission_logger.log(
+                "execution_result.ingested",
+                mission_id=str(result.mission_id),
+                task_id=str(result.task_id),
+                status="completed",
+                duration_ms=duration_ms,
+                details={
+                    "assets": len(assets),
+                    "evidence": len(validated_evidence),
+                    "findings": len(produced_findings),
+                    "persisted": outcome.persisted,
+                },
+            )
+            return outcome
+
+    async def process_evidence(
+        self,
+        evidence: EvidenceDomain,
+        mission_id: UUID,
+    ) -> IngestionResult:
+        """Compatibility entry point routed through the production pipeline."""
+        task_id = evidence.task_id or evidence.source.execution_id or UUID(int=0)
+        return await self.process_execution_result(TaskExecutionResult(
+            mission_id=mission_id,
+            task_id=task_id,
+            capability=evidence.metadata.get("capability", "direct_evidence"),
+            evidence=[evidence],
+        ))
+
+    def _merge_with_state_assets(
+        self,
+        mission_id: UUID,
+        observed_assets: List[Asset],
+    ) -> List[Asset]:
+        existing = {
+            asset.value: asset
+            for asset in self.state_manager.get_assets(mission_id)
+        }
+        merged: List[Asset] = []
+        for asset in observed_assets:
+            key = asset.value
+            merged.append(merge_assets(existing[key], asset) if key in existing else asset)
+        return merged
+
+    async def _produce_findings(
+        self,
+        mission_id: UUID,
+        evidence: List[EvidenceDomain],
+        assets: List[Asset],
+    ) -> List[Finding]:
+        correlator = EvidenceCorrelator()
+        for rule in self._correlation_rules:
+            correlator.register_rule(rule)
+        correlations = await correlator.correlate(evidence, mission_id=mission_id, assets=assets)
+
+        evidence_by_id = {item.id: item for item in evidence}
+        asset_by_id = {asset.id: asset for asset in assets}
+        asset_by_value = {asset.value: asset for asset in assets}
+        findings: Dict[UUID, Finding] = {}
+        correlated_evidence_ids: set[UUID] = set()
+
+        for correlation in correlations:
+            supporting = [
+                evidence_by_id[evidence_id]
+                for evidence_id in correlation.evidence_ids
+                if evidence_id in evidence_by_id
+            ]
+            if not supporting:
+                continue
+            correlated_evidence_ids.update(item.id for item in supporting)
+            finding = self._finding_from_correlation(
+                mission_id,
+                correlation,
+                supporting,
+                asset_by_id,
+                asset_by_value,
+            )
+            findings[finding.id] = finding
+
+        # A positive vulnerability matcher is itself explicit finding support,
+        # even when no multi-evidence correlation rule matched it.
+        for item in evidence:
+            if item.evidence_type != EvidenceType.VULNERABILITY:
+                continue
+            if item.id in correlated_evidence_ids:
+                continue
+            finding_id = uuid5(
+                NAMESPACE_URL,
+                f"oracle:{mission_id}:vulnerability:{item.id}",
+            )
+            asset = asset_by_id.get(item.asset_id) if item.asset_id else None
+            severity = self._finding_severity([item])
+            findings[finding_id] = Finding(
+                id=finding_id,
+                mission_id=mission_id,
+                title=item.title,
+                description=item.description,
+                severity=severity,
+                confidence=item.confidence,
+                asset_id=item.asset_id,
+                asset_value=item.asset_value,
+                asset_type=asset.asset_type.value if asset else "",
+                evidence_ids=[item.id],
+                cve_id=item.cve_ids[0] if item.cve_ids else None,
+                cwe_id=item.cwe_ids[0] if item.cwe_ids else None,
+                mitre_technique_id=(
+                    item.mitre_techniques[0] if item.mitre_techniques else None
+                ),
+                discovered_by=f"tool:{item.source.tool_name}",
+                tags=list(item.tags),
+                metadata={"source": "explicit_vulnerability_evidence"},
+            )
+        return list(findings.values())
+
+    def _finding_from_correlation(
+        self,
+        mission_id: UUID,
+        correlation: CorrelationResult,
+        supporting: List[EvidenceDomain],
+        asset_by_id: Dict[UUID, Asset],
+        asset_by_value: Dict[str, Asset],
+    ) -> Finding:
+        evidence_ids = sorted((item.id for item in supporting), key=str)
+        finding_id = uuid5(
+            NAMESPACE_URL,
+            "oracle:{}:correlation:{}:{}:{}:{}".format(
+                mission_id,
+                correlation.rule_name,
+                correlation.asset_value,
+                f"{correlation.port or ''}:{correlation.technology or correlation.service or ''}",
+                ",".join(sorted(correlation.cve_ids)),
+            ),
+        )
+        asset = None
+        if correlation.asset_id:
+            asset = asset_by_id.get(correlation.asset_id)
+        if asset is None:
+            asset = asset_by_value.get(correlation.asset_value)
+        if asset is None:
+            asset = next(
+                (asset_by_id[item.asset_id] for item in supporting if item.asset_id in asset_by_id),
+                None,
+            )
+        cwe_ids = [cwe for item in supporting for cwe in item.cwe_ids]
+        techniques = [technique for item in supporting for technique in item.mitre_techniques]
+        title = correlation.description or f"{correlation.rule_name} correlation"
+        return Finding(
+            id=finding_id,
+            mission_id=mission_id,
+            title=title,
+            description=correlation.reasoning or correlation.description,
+            severity=self._finding_severity(supporting),
+            confidence=correlation.confidence,
+            asset_id=asset.id if asset else supporting[0].asset_id,
+            asset_value=correlation.asset_value or supporting[0].asset_value,
+            asset_type=asset.asset_type.value if asset else "",
+            evidence_ids=evidence_ids,
+            cve_id=correlation.cve_ids[0] if correlation.cve_ids else None,
+            cwe_id=cwe_ids[0] if cwe_ids else None,
+            mitre_technique_id=techniques[0] if techniques else None,
+            affected_port=correlation.port,
+            affected_component=correlation.technology or correlation.service or "",
+            discovered_by=f"correlation:{correlation.rule_name}",
+            metadata={
+                "correlation_id": str(correlation.id),
+                "correlation_type": correlation.correlation_type.value,
+                "matched_on": correlation.matched_on,
+            },
+        )
+
+    @staticmethod
+    def _finding_severity(evidence: List[EvidenceDomain]) -> FindingSeverity:
+        order = {
+            "informational": 0,
+            "info": 0,
+            "low": 1,
+            "medium": 2,
+            "high": 3,
+            "critical": 4,
+        }
+        observed = max(
+            (str(item.severity).lower() for item in evidence),
+            key=lambda value: order.get(value, 0),
+            default="informational",
+        )
+        if observed == "info":
+            observed = "informational"
+        return FindingSeverity(observed) if observed in {s.value for s in FindingSeverity} else FindingSeverity.INFO
+
+    @staticmethod
+    def _counter_values(
+        assets: Any,
+        evidence: Any,
+        findings: Any,
+    ) -> Dict[str, Any]:
+        asset_list = list(assets)
+        evidence_list = list(evidence)
+        finding_list = list(findings)
+        return {
+            "total_assets": len(asset_list),
+            "total_evidence": len(evidence_list),
+            "total_findings": len(finding_list),
+            "critical_findings": sum(f.severity == FindingSeverity.CRITICAL for f in finding_list),
+            "high_findings": sum(f.severity == FindingSeverity.HIGH for f in finding_list),
+            "medium_findings": sum(f.severity == FindingSeverity.MEDIUM for f in finding_list),
+            "low_findings": sum(f.severity == FindingSeverity.LOW for f in finding_list),
+            "overall_risk_score": max(
+                (f.risk_score for f in finding_list if f.risk_score is not None),
+                default=None,
+            ),
+        }
+
+    async def _project_ingestion_to_graph(self, outcome: IngestionResult) -> None:
+        if not self.knowledge_graph.is_available:
+            self._degraded_mode.update_status("neo4j", DependencyStatus.UNAVAILABLE)
+            outcome.degraded_dependencies.append("neo4j")
+            return
+        try:
+            for asset in outcome.assets:
+                await self.knowledge_graph.create_asset_node(
+                    asset.id,
+                    outcome.mission_id,
+                    asset.asset_type.value,
+                    asset.value,
+                    asset.label,
+                    asset.ip_addresses,
+                    asset.hostnames,
+                    asset.open_ports,
+                    asset.os or "",
+                )
+            for evidence in outcome.evidence:
+                await self.knowledge_graph.create_evidence_node(
+                    evidence.id,
+                    outcome.mission_id,
+                    evidence.asset_id,
+                    evidence.evidence_type.value,
+                    evidence.title,
+                    evidence.confidence,
+                )
+            for finding in outcome.findings:
+                await self.knowledge_graph.create_finding_node(
+                    finding.id,
+                    finding.asset_id,
+                    finding.title,
+                    finding.severity.value,
+                    finding.cve_id or "",
+                    finding.mitre_technique_id or "",
+                    mission_id=outcome.mission_id,
+                    evidence_ids=finding.evidence_ids,
+                    cwe_id=finding.cwe_id or "",
+                    risk_score=finding.risk_score,
+                    risk_level=finding.risk_level,
+                    risk_id=finding.risk_calculation_metadata.get("risk_id", ""),
+                )
+            outcome.graph_projected = True
+            self._degraded_mode.update_status("neo4j", DependencyStatus.HEALTHY)
+        except Exception as exc:
+            self._degraded_mode.update_status("neo4j", DependencyStatus.DEGRADED)
+            outcome.degraded_dependencies.append("neo4j")
+            logger.error(
+                "runtime.graph_projection_failed",
+                mission_id=str(outcome.mission_id),
+                task_id=str(outcome.task_id),
+                error=str(exc),
+            )
+
+    @asynccontextmanager
+    async def _persistence_scope(self) -> AsyncIterator[Optional[Any]]:
+        """Yield an injected adapter or a fresh PostgreSQL transaction."""
+        if self.mission_service is not None:
+            yield self.mission_service
+            return
+        if not self._database_available:
+            yield None
+            return
+
+        from backend.database import session_scope
+        from backend.services import MissionService
+
+        async with session_scope() as session:
+            yield MissionService(session)
+
+    async def get_authoritative_findings(
+        self,
+        mission_id: Optional[UUID] = None,
+        severity: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Optional[List[Any]]:
+        """Read PostgreSQL findings, or signal that state fallback is required."""
+        try:
+            async with self._persistence_scope() as service:
+                loader = getattr(service, "list_findings", None) if service else None
+                if loader:
+                    return await loader(
+                        mission_id=mission_id,
+                        severity=severity,
+                        status=status,
+                    )
+        except Exception as exc:
+            logger.warning("runtime.persisted_findings_read_failed", error=str(exc))
+        return None
+
+    async def get_authoritative_finding(self, finding_id: UUID) -> Optional[Any]:
+        """Read one PostgreSQL finding when durable persistence is available."""
+        try:
+            async with self._persistence_scope() as service:
+                loader = getattr(service, "get_finding", None) if service else None
+                if loader:
+                    return await loader(finding_id)
+        except Exception as exc:
+            logger.warning(
+                "runtime.persisted_finding_read_failed",
+                finding_id=str(finding_id),
+                error=str(exc),
+            )
+        return None
+
+    async def get_authoritative_missions(self) -> Optional[List[Any]]:
+        """Read persisted missions for completed-mission API paths."""
+        try:
+            async with self._persistence_scope() as service:
+                loader = getattr(service, "list_missions", None) if service else None
+                if loader:
+                    return await loader(limit=10000, offset=0)
+        except Exception as exc:
+            logger.warning("runtime.persisted_missions_read_failed", error=str(exc))
+        return None
+
+    async def get_authoritative_mission(self, mission_id: UUID) -> Optional[Any]:
+        """Read one persisted mission for restart-safe report retrieval."""
+        try:
+            async with self._persistence_scope() as service:
+                loader = getattr(service, "get_mission", None) if service else None
+                if loader:
+                    return await loader(mission_id)
+        except Exception as exc:
+            logger.warning(
+                "runtime.persisted_mission_read_failed",
+                mission_id=str(mission_id),
+                error=str(exc),
+            )
+        return None
+
+    async def get_authoritative_assets(self, mission_id: UUID) -> Optional[List[Any]]:
+        """Read persisted assets for dashboard/report completed-mission paths."""
+        try:
+            async with self._persistence_scope() as service:
+                loader = getattr(service, "list_assets", None) if service else None
+                if loader:
+                    return await loader(mission_id, limit=10000, offset=0)
+        except Exception as exc:
+            logger.warning(
+                "runtime.persisted_assets_read_failed",
+                mission_id=str(mission_id),
+                error=str(exc),
+            )
+        return None
+
+    @staticmethod
+    def _mark_persistence_degraded(mission: Mission, error: Optional[str] = None) -> None:
+        mission.metadata["persistence"] = {
+            "postgresql": "unavailable",
+            "durable": False,
+            **({"error": error} if error else {}),
+        }
 
     # ─── Internal ────────────────────────────────────────────────────────
 
@@ -449,6 +990,12 @@ class OracleRuntime:
         for capability in DiscoveryAgent.capabilities:
             async def handler(task: Task, cap=capability) -> Any:
                 agent = self._discovery_agents.setdefault(task.mission_id, DiscoveryAgent())
+                execution_result = TaskExecutionResult(
+                    mission_id=task.mission_id,
+                    task_id=task.id,
+                    capability=task.capability or cap.name,
+                    metadata={"task_name": task.name},
+                )
                 context = {
                     "mission_id": task.mission_id,
                     "task": task.__dict__,
@@ -457,16 +1004,21 @@ class OracleRuntime:
                     "params": task.params,
                     "config": task.config,
                 }
-                results = []
                 async for raw_evidence in agent.execute(context):
                     if raw_evidence.evidence_type == "error":
+                        execution_result.success = False
+                        execution_result.errors.append(
+                            raw_evidence.data.get("error", "Discovery task failed")
+                        )
                         raise RuntimeError(
                             raw_evidence.data.get("error", "Discovery task failed")
                         )
                     evidence = from_agent_evidence(raw_evidence, task.mission_id)
-                    await self.process_evidence(evidence, task.mission_id)
-                    results.append(evidence)
-                return results
+                    execution_result.evidence.append(evidence)
+                execution_result.completed_at = datetime.now(timezone.utc)
+                if execution_result.assets or execution_result.evidence:
+                    await self.process_execution_result(execution_result)
+                return execution_result
 
             self.register_capability_handler(capability.name, handler)
 
@@ -491,11 +1043,16 @@ class OracleRuntime:
         await self.state_manager.archive_mission_state(mission_id)
 
     async def _persist_mission_status(self, mission_id: UUID, status: MissionStatus) -> None:
-        if self.mission_service:
-            try:
-                await self.mission_service.update_mission_status(mission_id, status)
-            except Exception as e:
-                logger.error("runtime.persist_status_failed", error=str(e))
+        try:
+            async with self._persistence_scope() as service:
+                if service:
+                    await service.update_mission_status(mission_id, status)
+        except Exception as e:
+            self._degraded_mode.update_status("postgresql", DependencyStatus.UNAVAILABLE)
+            mission = self.mission_manager.get_mission(mission_id)
+            if mission:
+                self._mark_persistence_degraded(mission, str(e))
+            logger.error("runtime.persist_status_failed", error=str(e))
         if self.knowledge_graph.is_available:
             try:
                 await self.knowledge_graph.update_mission_status(mission_id, status.value)
@@ -504,11 +1061,13 @@ class OracleRuntime:
 
     async def _log_event(self, mission_id: UUID, event_type: str, data: Dict[str, Any]) -> None:
         await self.state_manager.log_event(mission_id, event_type, data)
-        if self.mission_service:
-            try:
-                await self.mission_service.log_event(mission_id, event_type, data)
-            except Exception:
-                pass
+        try:
+            async with self._persistence_scope() as service:
+                if service:
+                    await service.log_event(mission_id, event_type, data=data)
+        except Exception as e:
+            self._degraded_mode.update_status("postgresql", DependencyStatus.DEGRADED)
+            logger.error("runtime.persist_event_failed", error=str(e))
 
 
 # Global Runtime instance

@@ -15,8 +15,7 @@ The service:
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional, Set
-from uuid import UUID
+from typing import Any, Dict, List, Optional
 
 from core.logging import get_logger
 from domain.intelligence import (
@@ -48,13 +47,22 @@ class ThreatIntelligenceService:
         # ti.cve, ti.epss, ti.kev, ti.mitre, etc.
     """
 
-    def __init__(self) -> None:
-        self._cve_service = CVEService()
-        self._cwe_service = CWEService()
-        self._owasp_service = OWASPService()
-        self._epss_service = EPSSService()
-        self._kev_service = KEVService()
-        self._mitre_mapper = MitreMapper()
+    def __init__(
+        self,
+        *,
+        cve_service: Optional[Any] = None,
+        cwe_service: Optional[Any] = None,
+        owasp_service: Optional[Any] = None,
+        epss_service: Optional[Any] = None,
+        kev_service: Optional[Any] = None,
+        mitre_mapper: Optional[Any] = None,
+    ) -> None:
+        self._cve_service = cve_service or CVEService()
+        self._cwe_service = cwe_service or CWEService()
+        self._owasp_service = owasp_service or OWASPService()
+        self._epss_service = epss_service or EPSSService()
+        self._kev_service = kev_service or KEVService()
+        self._mitre_mapper = mitre_mapper or MitreMapper()
 
         # Simple in-memory cache: identifier -> ThreatIntelligence
         self._cache: Dict[str, ThreatIntelligence] = {}
@@ -87,84 +95,93 @@ class ThreatIntelligenceService:
         if cache_key and cache_key in self._cache and not force_refresh:
             return self._cache[cache_key]
 
-        # Run all lookups in parallel
-        cve_future = self._lookup_cve(cve_id) if cve_id else None
-        cwe_future = self._lookup_cwe(cwe_id) if cwe_id else None
-        owasp_future = self._lookup_owasp(cwe_id) if cwe_id else None
-        epss_future = self._lookup_epss(cve_id) if cve_id else None
-        kev_future = self._lookup_kev(cve_id) if cve_id else None
-        mitre_future = self._lookup_mitre(cve_id, cwe_id, tags, evidence_type) if (tags or evidence_type or cve_id or cwe_id) else None
+        lookups: List[tuple[str, Any]] = []
+        if cve_id:
+            lookups.extend([
+                ("cve", self._lookup_cve(cve_id)),
+                ("epss", self._lookup_epss(cve_id)),
+                ("kev", self._lookup_kev(cve_id)),
+            ])
+        if cwe_id:
+            lookups.extend([
+                ("cwe", self._lookup_cwe(cwe_id)),
+                ("owasp", self._lookup_owasp(cwe_id)),
+            ])
+        if tags or evidence_type or cve_id or cwe_id:
+            lookups.append(("mitre", self._lookup_mitre(cve_id, cwe_id, tags, evidence_type)))
 
-        futures = [f for f in [cve_future, cwe_future, owasp_future, epss_future, kev_future, mitre_future] if f is not None]
-
-        results = await asyncio.gather(*futures, return_exceptions=True)
-
-        # Collect results, treating exceptions as None
         ti = ThreatIntelligence()
-        idx = 0
+        results = await asyncio.gather(
+            *(lookup for _, lookup in lookups), return_exceptions=True
+        )
+        for (provider, _), result in zip(lookups, results):
+            self._record_result(ti, provider, result)
 
-        if cve_future:
-            result = results[idx]
-            if isinstance(result, CVEInfo):
-                ti.cve = result
-            elif isinstance(result, Exception):
-                logger.warning("threat_intel.cve_lookup_failed", error=str(result))
-            idx += 1
+        # A CVE response is authoritative for its CWE mapping. Resolve the
+        # first mapped weakness only when the finding did not already carry a
+        # CWE, then reuse the existing CWE and OWASP providers.
+        derived_cwe = (
+            ti.cve.cwe_ids[0]
+            if not cwe_id and ti.cve and ti.cve.cwe_ids
+            else None
+        )
+        if derived_cwe:
+            derived = await asyncio.gather(
+                self._lookup_cwe(derived_cwe),
+                self._lookup_owasp(derived_cwe),
+                return_exceptions=True,
+            )
+            self._record_result(ti, "cwe", derived[0])
+            self._record_result(ti, "owasp", derived[1])
 
-        if cwe_future:
-            result = results[idx]
-            if isinstance(result, CWEInfo):
-                ti.cwe = result
-            elif isinstance(result, Exception):
-                logger.warning("threat_intel.cwe_lookup_failed", error=str(result))
-            idx += 1
-
-        if owasp_future:
-            result = results[idx]
-            if isinstance(result, OWASPInfo):
-                ti.owasp = result
-            elif isinstance(result, Exception):
-                logger.warning("threat_intel.owasp_lookup_failed", error=str(result))
-            idx += 1
-
-        if epss_future:
-            result = results[idx]
-            if isinstance(result, EPSSInfo):
-                ti.epss = result
-            elif isinstance(result, Exception):
-                logger.warning("threat_intel.epss_lookup_failed", error=str(result))
-            idx += 1
-
-        if kev_future:
-            result = results[idx]
-            if isinstance(result, KEVInfo):
-                ti.kev = result
-            elif isinstance(result, Exception):
-                logger.warning("threat_intel.kev_lookup_failed", error=str(result))
-            idx += 1
-
-        if mitre_future:
-            result = results[idx]
-            if isinstance(result, list):
-                ti.mitre = [
-                    MitreIntelInfo(
-                        technique_id=m.technique_id,
-                        technique_name=m.technique_name,
-                        tactic=m.tactic,
-                        tactic_id=m.tactic_id,
-                        confidence=m.confidence,
-                        matched_on=m.matched_on,
-                    )
-                    for m in result
-                ]
-            elif isinstance(result, Exception):
-                logger.warning("threat_intel.mitre_mapping_failed", error=str(result))
+        ti.degraded = any(status == "failed" for status in ti.provider_status.values())
 
         # Cache the result
         if cache_key:
             self._cache[cache_key] = ti
 
         return ti
+
+    @staticmethod
+    def _record_result(
+        ti: ThreatIntelligence,
+        provider: str,
+        result: Any,
+    ) -> None:
+        """Attach one provider result while preserving failure provenance."""
+        if isinstance(result, Exception):
+            ti.provider_status[provider] = "failed"
+            ti.provider_errors[provider] = str(result)
+            logger.warning(
+                "threat_intel.provider_lookup_failed",
+                provider=provider,
+                error=str(result),
+            )
+            return
+
+        ti.provider_status[provider] = "available" if result is not None else "not_found"
+        if provider == "cve" and isinstance(result, CVEInfo):
+            ti.cve = result
+        elif provider == "cwe" and isinstance(result, CWEInfo):
+            ti.cwe = result
+        elif provider == "owasp" and isinstance(result, OWASPInfo):
+            ti.owasp = result
+        elif provider == "epss" and isinstance(result, EPSSInfo):
+            ti.epss = result
+        elif provider == "kev" and isinstance(result, KEVInfo):
+            ti.kev = result
+        elif provider == "mitre" and isinstance(result, list):
+            ti.mitre = [
+                MitreIntelInfo(
+                    technique_id=item.technique_id,
+                    technique_name=item.technique_name,
+                    tactic=item.tactic,
+                    tactic_id=item.tactic_id,
+                    confidence=item.confidence,
+                    matched_on=item.matched_on,
+                )
+                for item in result
+            ]
 
     async def enrich_finding(
         self,
@@ -291,9 +308,10 @@ class ThreatIntelligenceService:
 
     async def close(self) -> None:
         """Close all provider connections."""
-        await self._cve_service.close()
-        await self._epss_service.close()
-        await self._kev_service.close()
+        for service in (self._cve_service, self._epss_service, self._kev_service):
+            close = getattr(service, "close", None)
+            if close:
+                await close()
 
 
 __all__ = ["ThreatIntelligenceService"]
