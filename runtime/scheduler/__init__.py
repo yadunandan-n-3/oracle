@@ -35,9 +35,16 @@ class ScheduledItem:
 
     priority: int
     created_at: datetime
-    task_id: UUID = field(compare=False)
+    task: Task = field(compare=False)
     plan_id: UUID = field(compare=False)
-    mission_id: UUID = field(compare=False)
+
+    @property
+    def task_id(self) -> UUID:
+        return self.task.id
+
+    @property
+    def mission_id(self) -> UUID:
+        return self.task.mission_id
 
 
 class Scheduler:
@@ -59,12 +66,14 @@ class Scheduler:
     ) -> None:
         self._queue: List[ScheduledItem] = []
         self._running_tasks: Dict[UUID, asyncio.Task] = {}
+        self._task_models: Dict[UUID, Task] = {}
         self._dead_letter_queue: List[Tuple[Task, str]] = []
         self._max_concurrent = max_concurrent
         self._poll_interval = poll_interval
         self._running = False
         self._worker: Optional[asyncio.Task] = None
         self._task_executor: Optional[Callable[[Task], Any]] = None
+        self._task_failure_handler: Optional[Callable[[Task, str], Any]] = None
         self._event_bus = get_event_bus()
         self._total_scheduled = 0
         self._total_completed = 0
@@ -125,23 +134,27 @@ class Scheduler:
         """Set the task executor function."""
         self._task_executor = executor
 
+    def set_failure_handler(self, handler: Callable[[Task, str], Any]) -> None:
+        """Set the callback invoked after a task exhausts its retries."""
+        self._task_failure_handler = handler
+
     async def schedule_plan(self, plan: Plan) -> None:
         """Schedule all tasks in a plan."""
         for task in plan.tasks:
             if task.status == TaskStatus.READY:
-                await self.schedule_task(task)
+                await self.schedule_task(task, plan.id)
 
-    async def schedule_task(self, task: Task) -> None:
-        """Schedule a single task for execution."""
+    async def schedule_task(self, task: Task, plan_id: Optional[UUID] = None) -> None:
+        """Schedule the canonical planner task without reconstructing it."""
         item = ScheduledItem(
             priority=task.priority.value,
             created_at=datetime.now(timezone.utc),
-            task_id=task.id,
-            plan_id=UUID(int=0),
-            mission_id=task.mission_id,
+            task=task,
+            plan_id=plan_id or UUID(int=0),
         )
 
         heapq.heappush(self._queue, item)
+        self._task_models[task.id] = task
         self._total_scheduled += 1
 
         telemetry.increment_counter("scheduler.task_scheduled", attributes={"priority": str(task.priority.name)})
@@ -161,9 +174,9 @@ class Scheduler:
         item = heapq.heappop(self._queue)
         return self._task_from_item(item) if self._task_executor else None
 
-    def _task_from_item(self, item: ScheduledItem) -> Optional[Task]:
-        """Reconstruct a task from a scheduled item (placeholder)."""
-        return None
+    def _task_from_item(self, item: ScheduledItem) -> Task:
+        """Return the exact task produced by the planner."""
+        return item.task
 
     # ─── Scheduler Loop ────────────────────────────────────────────────────
 
@@ -187,21 +200,10 @@ class Scheduler:
             return
 
         dispatched = 0
-        remaining: List[ScheduledItem] = []
-
         while self._queue and dispatched < available_slots:
             item = heapq.heappop(self._queue)
-            task = Task(
-                id=item.task_id,
-                mission_id=item.mission_id,
-                name=f"task_{item.task_id}",
-                priority=TaskPriority(item.priority),
-            )
-            await self._dispatch_task(task, item.plan_id)
+            await self._dispatch_task(item.task, item.plan_id)
             dispatched += 1
-
-        for item in remaining:
-            heapq.heappush(self._queue, item)
 
     async def _dispatch_task(self, task: Task, plan_id: UUID) -> None:
         """Dispatch a task to the executor."""
@@ -214,20 +216,22 @@ class Scheduler:
                 mission_logger.start_timer(f"task_{task.id}")
 
                 await self._event_bus.publish(OracleEvent(
-                    event_type=EventType.MISSION_TASK_ASSIGNED,
+                    event_type=EventType.MISSION_TASK_STARTED,
                     source="scheduler",
                     mission_id=task.mission_id,
                     data={"task_id": str(task.id), "task_name": task.name},
                 ))
 
-                if self._task_executor:
-                    try:
-                        result = await asyncio.wait_for(
-                            self._task_executor(task),
-                            timeout=task.timeout_seconds,
-                        )
-                    except asyncio.TimeoutError:
-                        raise TimeoutError(operation=task.name, timeout_seconds=task.timeout_seconds)
+                if not self._task_executor:
+                    raise RuntimeError("Scheduler task executor is not configured")
+
+                try:
+                    await asyncio.wait_for(
+                        self._task_executor(task),
+                        timeout=task.timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    raise TimeoutError(operation=task.name, timeout_seconds=task.timeout_seconds)
 
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = datetime.now(timezone.utc)
@@ -271,12 +275,15 @@ class Scheduler:
                         details={"task_id": str(task.id), "retries_left": task.max_retries},
                     )
                     await asyncio.sleep(2.0 ** (3 - task.max_retries))
-                    await self.schedule_task(task)
+                    task.status = TaskStatus.READY
+                    await self.schedule_task(task, plan_id)
                 else:
                     self._dead_letter_queue.append((task, str(e)))
+                    if self._task_failure_handler:
+                        await self._task_failure_handler(task, str(e))
 
                 await self._event_bus.publish(OracleEvent(
-                    event_type=EventType.MISSION_TASK_ASSIGNED,
+                    event_type=EventType.MISSION_TASK_FAILED,
                     source="scheduler",
                     mission_id=task.mission_id,
                     data={"task_id": str(task.id), "error": str(e)},
@@ -290,6 +297,25 @@ class Scheduler:
 
         asyncio_task = asyncio.create_task(execute_task())
         self._running_tasks[task.id] = asyncio_task
+
+    async def cancel_mission(
+        self,
+        mission_id: UUID,
+        exclude_task_id: Optional[UUID] = None,
+    ) -> None:
+        """Remove queued work and cancel running work for one mission."""
+        self._queue = [item for item in self._queue if item.mission_id != mission_id]
+        heapq.heapify(self._queue)
+
+        running = [
+            running_task
+            for task_id, running_task in self._running_tasks.items()
+            if self._task_models.get(task_id)
+            and self._task_models[task_id].mission_id == mission_id
+            and task_id != exclude_task_id
+        ]
+        for running_task in running:
+            running_task.cancel()
 
     # ─── Queue Management ──────────────────────────────────────────────────
 

@@ -49,7 +49,7 @@ from runtime.resource_manager import ResourceManager, ResourceQuota
 from runtime.scheduler import Scheduler
 from runtime.state_manager import StateManager
 from runtime.validator import Validator
-from runtime.workflow import WorkflowEngine
+from runtime.workflow import WorkflowEngine, WorkflowResult, WorkflowStatus
 from tools.nmap import NmapPlugin
 from tools.nuclei import NucleiPlugin
 
@@ -76,7 +76,11 @@ class OracleRuntime:
         self.policy_engine = PolicyEngine()
         self.resource_manager = ResourceManager()
         self.validator = Validator()
-        self.workflow_engine = WorkflowEngine(scheduler=self.scheduler, state_manager=self.state_manager)
+        self.workflow_engine = WorkflowEngine(
+            scheduler=self.scheduler,
+            state_manager=self.state_manager,
+            planner=self.planner,
+        )
 
         # Persistence
         self.mission_service: Optional[any] = None
@@ -91,6 +95,7 @@ class OracleRuntime:
 
         # Registry
         self._registered_handlers: Dict[str, Any] = {}
+        self._discovery_agents: Dict[UUID, Any] = {}
         self._started_at: Optional[datetime] = None
 
     # ─── Lifecycle ────────────────────────────────────────────────────────
@@ -107,6 +112,12 @@ class OracleRuntime:
         self._started_at = datetime.now(timezone.utc)
 
         await self._event_bus.start()
+
+        # Task handlers and scheduler callbacks must exist before the worker
+        # can dispatch any queued task.
+        self._register_tools()
+        self._register_capability_handlers()
+        self._register_event_handlers()
         await self.scheduler.start()
 
         # Initialize database
@@ -141,10 +152,6 @@ class OracleRuntime:
             logger.warning("runtime.knowledge_graph_init_timeout")
         except Exception as e:
             logger.warning("runtime.knowledge_graph_init_failed", error=str(e))
-
-        self._register_tools()
-        self._register_capability_handlers()
-        self._register_event_handlers()
 
         await self._event_bus.publish(OracleEvent(
             event_type=EventType.SYSTEM_STARTUP,
@@ -244,12 +251,12 @@ class OracleRuntime:
         logger.info("runtime.mission_created", mission_id=str(mission.id), mission_type=mission_type.value)
         return mission
 
-    async def execute_mission(self, mission_id: UUID) -> None:
+    async def execute_mission(self, mission_id: UUID) -> Optional[WorkflowResult]:
         """Execute a mission end-to-end (policy -> plan -> execute -> persist)."""
         mission = self.mission_manager.get_mission(mission_id)
         if not mission:
             logger.error("runtime.mission_not_found", mission_id=str(mission_id))
-            return
+            return None
 
         mission_id_str = str(mission_id)
         mission_logger.start_timer("mission_total")
@@ -266,7 +273,7 @@ class OracleRuntime:
             await self._persist_mission_status(mission_id, MissionStatus.FAILED)
             ms = mission_logger.elapsed_ms("mission_total") or 0.0
             mission_logger.log_mission_failed(mission_id_str, blocking_issues[0].message, ms)
-            return
+            return None
 
         # Start mission
         mission_logger.log("mission.started", mission_id=mission_id_str)
@@ -293,15 +300,33 @@ class OracleRuntime:
         # Execute
         mission_logger.log("mission.executing", mission_id=mission_id_str,
                            details={"total_tasks": plan.total_tasks})
+        mission.status = MissionStatus.IN_PROGRESS
+        mission.updated_at = datetime.now(timezone.utc)
         await self._persist_mission_status(mission_id, MissionStatus.IN_PROGRESS)
         try:
-            await self.workflow_engine.execute_plan(plan, mission)
+            workflow_timeout = float((mission.max_duration_minutes or 120) * 60)
+            result = await self.workflow_engine.execute_plan(
+                plan,
+                mission,
+                timeout_seconds=workflow_timeout,
+            )
         except Exception as e:
             ms = mission_logger.elapsed_ms("mission_total") or 0.0
             mission_logger.log_mission_failed(mission_id_str, str(e), ms)
             await self.mission_manager.fail_mission(mission_id, str(e))
             await self._persist_mission_status(mission_id, MissionStatus.FAILED)
             raise
+
+        if not result.succeeded:
+            if result.status == WorkflowStatus.CANCELLED:
+                return result
+            error = result.error or f"Workflow ended with status {result.status.value}"
+            ms = mission_logger.elapsed_ms("mission_total") or 0.0
+            mission_logger.log_mission_failed(mission_id_str, error, ms)
+            await self.mission_manager.fail_mission(mission_id, error)
+            await self._persist_mission_status(mission_id, MissionStatus.FAILED)
+            self._discovery_agents.pop(mission_id, None)
+            return result
 
         # Complete
         await self.mission_manager.complete_mission(mission_id)
@@ -320,8 +345,12 @@ class OracleRuntime:
             except Exception as e:
                 logger.error("runtime.graph_update_failed", error=str(e))
 
+        self._discovery_agents.pop(mission_id, None)
+        return result
+
     async def cancel_mission(self, mission_id: UUID) -> None:
         """Cancel a running mission."""
+        await self.workflow_engine.cancel_workflow(mission_id)
         await self.mission_manager.cancel_mission(mission_id)
         await self.state_manager.archive_mission_state(mission_id)
         await self._persist_mission_status(mission_id, MissionStatus.CANCELLED)
@@ -416,18 +445,24 @@ class OracleRuntime:
     def _register_capability_handlers(self) -> None:
         """Register capability handlers for the WorkflowEngine."""
         from ai.agents.discovery_agent import DiscoveryAgent
-        discovery_agent = DiscoveryAgent()
 
-        for capability in discovery_agent.capabilities:
-            async def handler(task: Task, agent=discovery_agent, cap=capability) -> Any:
+        for capability in DiscoveryAgent.capabilities:
+            async def handler(task: Task, cap=capability) -> Any:
+                agent = self._discovery_agents.setdefault(task.mission_id, DiscoveryAgent())
                 context = {
                     "mission_id": task.mission_id,
                     "task": task.__dict__,
-                    "capability": cap.name,
+                    "capability": task.capability or cap.name,
+                    "target": task.target,
+                    "params": task.params,
                     "config": task.config,
                 }
                 results = []
                 async for raw_evidence in agent.execute(context):
+                    if raw_evidence.evidence_type == "error":
+                        raise RuntimeError(
+                            raw_evidence.data.get("error", "Discovery task failed")
+                        )
                     evidence = from_agent_evidence(raw_evidence, task.mission_id)
                     await self.process_evidence(evidence, task.mission_id)
                     results.append(evidence)

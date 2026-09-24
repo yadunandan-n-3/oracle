@@ -227,8 +227,9 @@ class DiscoveryAgent(OracleAgent):
             Evidence objects as assets are discovered
         """
         task = context.get("task", {})
-        task_id = task.get("id", "unknown")
-        params = task.get("params", {})
+        task_id = str(task.get("id", "unknown"))
+        capability = context.get("capability") or task.get("capability")
+        params = context.get("params") or task.get("params") or {}
 
         self._status = AgentStatus.RUNNING
         self._current_mission_id = context.get("mission_id")
@@ -237,7 +238,35 @@ class DiscoveryAgent(OracleAgent):
         mission_logger.log("agent.started", mission_id=str(self._current_mission_id) if self._current_mission_id else "", task_id=task_id, agent=self.name, status="started")
 
         try:
-            if task_id == "health_check":
+            # Canonical runtime tasks are routed by capability. The semantic
+            # string IDs remain as an adapter for the agent's standalone plan.
+            if capability == "port_scanning":
+                explicit_target = context.get("target") or task.get("target")
+                config = context.get("config") or task.get("config") or {}
+                targets = [explicit_target] if explicit_target else []
+                if not targets:
+                    targets.extend(config.get("target_domains", []))
+                    targets.extend(config.get("target_ip_ranges", []))
+                    targets.extend(config.get("target_ips", []))
+                    targets.extend(config.get("target_urls", []))
+                if not targets:
+                    raise ValueError("port_scanning task has no target")
+                for target in targets:
+                    async for evidence in self._execute_port_scan(context, target, params):
+                        yield evidence
+
+            elif capability in {"service_discovery", "os_detection"}:
+                async for evidence in self._execute_service_discovery(context):
+                    yield evidence
+
+            elif capability == "vulnerability_scanning":
+                async for evidence in self._execute_vulnerability_scan(context, params):
+                    yield evidence
+
+            elif capability == "technology_detection":
+                yield await self._execute_asset_compilation(context)
+
+            elif task_id == "health_check":
                 yield await self._execute_health_check(context)
 
             elif task_id.startswith("port_scan_"):
@@ -257,7 +286,9 @@ class DiscoveryAgent(OracleAgent):
                 yield await self._execute_asset_compilation(context)
 
             else:
-                logger.warning("discovery_agent.unknown_task", task_id=task_id)
+                raise ValueError(
+                    f"Unsupported discovery task {task_id!r} with capability {capability!r}"
+                )
 
         except Exception as e:
             logger.error(

@@ -60,8 +60,15 @@ class Task:
     status: TaskStatus = TaskStatus.PENDING
 
     # Capability requirements
+    capability: str = ""
     required_capabilities: List[str] = field(default_factory=list)
     required_tools: List[str] = field(default_factory=list)
+
+    # Canonical execution input.  A task may address one explicit target or
+    # use the target collections in ``config`` for capability-wide work.
+    target: Optional[str] = None
+    params: Dict[str, Any] = field(default_factory=dict)
+    required: bool = True
 
     # Dependencies
     depends_on: List[UUID] = field(default_factory=list)
@@ -77,6 +84,13 @@ class Task:
     error: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        """Keep the singular capability and compatibility list in sync."""
+        if self.capability and not self.required_capabilities:
+            self.required_capabilities = [self.capability]
+        elif not self.capability and self.required_capabilities:
+            self.capability = self.required_capabilities[0]
 
 
 @dataclass
@@ -183,6 +197,7 @@ class Planner:
                     # priority instead of constructing an invalid enum value.
                     priority=TaskPriority(min(group_idx, TaskPriority.LOW.value)),
                     status=TaskStatus.PENDING,
+                    capability=capability,
                     required_capabilities=[capability],
                     depends_on=list(previous_task_ids),
                     config={
@@ -251,6 +266,10 @@ class Planner:
         """Get a plan by ID."""
         return self._plans.get(plan_id)
 
+    def register_plan(self, plan: Plan) -> None:
+        """Register an externally constructed plan for workflow execution."""
+        self._plans[plan.id] = plan
+
     def get_mission_plan(self, mission_id: UUID) -> Optional[Plan]:
         """Get the plan for a specific mission."""
         for plan in self._plans.values():
@@ -271,11 +290,11 @@ class Planner:
         task_id: UUID,
         status: TaskStatus,
         error: Optional[str] = None,
-    ) -> None:
-        """Update the status of a task."""
+    ) -> List[Task]:
+        """Update a task and return tasks newly unblocked by the change."""
         plan = self._plans.get(plan_id)
         if not plan:
-            return
+            return []
 
         for task in plan.tasks:
             if task.id == task_id:
@@ -290,10 +309,12 @@ class Planner:
 
         # Update ready tasks after dependency completion
         if status == TaskStatus.COMPLETED:
-            self._update_ready_tasks(plan)
+            return self._update_ready_tasks(plan)
+        return []
 
-    def _update_ready_tasks(self, plan: Plan) -> None:
-        """Mark tasks as READY when all dependencies are completed."""
+    def _update_ready_tasks(self, plan: Plan) -> List[Task]:
+        """Mark and return tasks whose dependencies have just completed."""
+        newly_ready: List[Task] = []
         for task in plan.tasks:
             if task.status != TaskStatus.PENDING:
                 continue
@@ -309,8 +330,12 @@ class Planner:
             if deps_met and not task.depends_on:
                 # No dependencies — always ready
                 task.status = TaskStatus.READY
+                newly_ready.append(task)
             elif deps_met:
                 task.status = TaskStatus.READY
+                newly_ready.append(task)
+
+        return newly_ready
 
 
 __all__ = ["Planner", "Plan", "Task", "TaskStatus", "TaskPriority"]

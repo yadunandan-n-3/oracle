@@ -1,198 +1,327 @@
-"""
-Workflow Engine
-===============
+"""Mission workflow orchestration.
 
-Orchestrates multi-step, multi-agent workflows in ORACLE.
-
-The Workflow Engine manages the execution flow:
-1. Accepts a plan from the Planner
-2. Coordinates agent execution through the Scheduler
-3. Handles branching, parallel execution, and conditional logic
-4. Manages workflow state and transitions
+The workflow owns the terminal completion primitive for a plan. Enqueuing a
+task is not completion: ``execute_plan`` returns only after every required task
+has completed or the workflow reaches a terminal failure/cancellation/timeout.
 """
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import UUID
 
-from core.events import EventType, OracleEvent
 from core.logging import get_logger
-from domain.asset import Asset
-from domain.evidence import Evidence
 from domain.mission import Mission
-from runtime.event_bus import EventBus, get_event_bus
-from runtime.planner import Plan, Task, TaskStatus
+from runtime.event_bus import get_event_bus
+from runtime.planner import Plan, Planner, Task, TaskStatus
 from runtime.scheduler import Scheduler
 from runtime.state_manager import StateManager
 
 logger = get_logger(__name__)
 
 
-class WorkflowEngine:
-    """
-    Coordinates the execution of mission plans.
+class WorkflowStatus(str, Enum):
+    SUCCESS = "success"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
 
-    The Workflow Engine:
-    - Receives a plan from the Planner
-    - Dispatches tasks to the Scheduler
-    - Monitors task completion
-    - Triggers downstream tasks when dependencies resolve
-    - Handles workflow-level errors and recovery
-    """
+
+@dataclass
+class WorkflowResult:
+    """Terminal, downstream-consumable result of one plan execution."""
+
+    mission_id: UUID
+    plan_id: UUID
+    status: WorkflowStatus
+    total_tasks: int
+    completed_tasks: int
+    failed_tasks: int
+    skipped_tasks: int
+    error: Optional[str] = None
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == WorkflowStatus.SUCCESS
+
+
+class MissingTaskHandlerError(RuntimeError):
+    """Raised when a required capability has no registered implementation."""
+
+
+class WorkflowEngine:
+    """Execute planner dependency graphs through the scheduler."""
 
     def __init__(
         self,
         scheduler: Scheduler,
         state_manager: StateManager,
+        planner: Optional[Planner] = None,
     ) -> None:
         self._scheduler = scheduler
         self._state_manager = state_manager
+        self._planner = planner or Planner()
         self._event_bus = get_event_bus()
         self._active_workflows: Dict[UUID, Plan] = {}
-        self._task_handlers: Dict[str, Callable] = {}
+        self._completion_futures: Dict[UUID, asyncio.Future[WorkflowResult]] = {}
+        self._scheduled_tasks: Dict[UUID, Set[UUID]] = {}
+        self._workflow_started_at: Dict[UUID, datetime] = {}
+        self._task_handlers: Dict[str, Callable[[Task], Any]] = {}
+
+        # Install callbacks before the scheduler can dispatch anything.
+        self._scheduler.set_executor(self._execute_task)
+        self._scheduler.set_failure_handler(self._fail_task)
 
     async def execute_plan(
         self,
         plan: Plan,
         mission: Mission,
-    ) -> None:
-        """
-        Execute a complete plan for a mission.
+        timeout_seconds: Optional[float] = None,
+    ) -> WorkflowResult:
+        """Execute and await a plan's actual terminal result without polling."""
+        if mission.id in self._active_workflows:
+            raise RuntimeError(f"Mission {mission.id} already has an active workflow")
 
-        This is the main entry point for mission execution.
-
-        Args:
-            plan: The plan to execute
-            mission: The mission this plan belongs to
-        """
+        started_at = datetime.now(timezone.utc)
         logger.info(
             "workflow.starting",
             mission_id=str(mission.id),
+            plan_id=str(plan.id),
             task_count=plan.total_tasks,
         )
 
-        # Initialize state
         await self._state_manager.initialize_mission_state(mission, plan)
+        self._planner.register_plan(plan)
         self._active_workflows[mission.id] = plan
+        self._scheduled_tasks[mission.id] = set()
+        self._workflow_started_at[mission.id] = started_at
+        future: asyncio.Future[WorkflowResult] = asyncio.get_running_loop().create_future()
+        self._completion_futures[mission.id] = future
 
-        # Register task handlers for common capabilities
-        self._register_default_handlers()
-
-        # Schedule all ready tasks
-        await self._scheduler.schedule_plan(plan)
-
-        # Set the executor function on the scheduler
-        self._scheduler.set_executor(self._execute_task)
+        ready_tasks = [task for task in plan.tasks if task.status == TaskStatus.READY]
+        if not plan.tasks:
+            self._resolve_workflow(mission.id, WorkflowStatus.SUCCESS)
+        elif not ready_tasks:
+            self._resolve_workflow(
+                mission.id,
+                WorkflowStatus.FAILED,
+                "Plan has tasks but no dependency-free task is ready",
+            )
+        else:
+            await self._schedule_tasks(plan, ready_tasks)
 
         logger.info(
             "workflow.started",
             mission_id=str(mission.id),
-            ready_tasks=len(self._scheduler.get_queue_stats()),
+            plan_id=str(plan.id),
+            ready_tasks=len(ready_tasks),
         )
+
+        try:
+            if timeout_seconds is None:
+                return await asyncio.shield(future)
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            error = f"Workflow timed out after {timeout_seconds} seconds"
+            await self._terminate_unfinished(mission.id, error, WorkflowStatus.TIMED_OUT)
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await self._terminate_unfinished(
+                mission.id,
+                "Workflow execution was cancelled",
+                WorkflowStatus.CANCELLED,
+            )
+            raise
+        finally:
+            self._completion_futures.pop(mission.id, None)
+
+    async def _schedule_tasks(self, plan: Plan, tasks: List[Task]) -> None:
+        scheduled = self._scheduled_tasks.setdefault(plan.mission_id, set())
+        fresh = [task for task in tasks if task.id not in scheduled]
+        if not fresh:
+            return
+
+        logger.info(
+            "workflow.dependency_wave_ready",
+            mission_id=str(plan.mission_id),
+            plan_id=str(plan.id),
+            task_ids=[str(task.id) for task in fresh],
+            task_names=[task.name for task in fresh],
+        )
+        for task in fresh:
+            scheduled.add(task.id)
+            await self._scheduler.schedule_task(task, plan.id)
 
     async def _execute_task(self, task: Task) -> Any:
-        """
-        Execute a single task within the workflow.
-
-        This dispatches to the appropriate handler based on
-        the task's required capabilities.
-
-        Args:
-            task: The task to execute
-
-        Returns:
-            Task execution result
-        """
-        # Register the task as active
+        """Dispatch the canonical task to its registered capability handler."""
         await self._state_manager.register_active_task(task.mission_id, task)
 
-        # Find the first matching handler
-        for capability in task.required_capabilities:
-            handler = self._task_handlers.get(capability)
-            if handler:
-                try:
-                    result = await handler(task)
-                    await self._complete_task(task)
-                    return result
-                except Exception as e:
-                    await self._fail_task(task, str(e))
-                    raise
-
-        # No handler found — mark as completed with warning
-        logger.warning(
-            "workflow.no_handler",
-            task_id=str(task.id),
-            capabilities=task.required_capabilities,
+        capabilities = task.required_capabilities or ([task.capability] if task.capability else [])
+        handler = next(
+            (self._task_handlers[cap] for cap in capabilities if cap in self._task_handlers),
+            None,
         )
+        if handler is None:
+            task.retry_on_failure = False
+            logger.error(
+                "workflow.missing_handler",
+                mission_id=str(task.mission_id),
+                task_id=str(task.id),
+                task_name=task.name,
+                required_capabilities=capabilities,
+            )
+            raise MissingTaskHandlerError(
+                f"No handler registered for required capabilities: {capabilities}"
+            )
+
+        result = await handler(task)
         await self._complete_task(task)
-        return None
+        return result
 
     async def _complete_task(self, task: Task) -> None:
-        """Handle task completion in the workflow."""
-        task.status = TaskStatus.COMPLETED
-        await self._state_manager.complete_task(task.mission_id, task)
+        """Persist completion, advance dependencies, and check the workflow."""
+        plan = self._active_workflows.get(task.mission_id)
+        if plan is None:
+            return
 
-        # Check if all tasks are done
+        newly_ready = await self._planner.update_task_status(
+            plan.id,
+            task.id,
+            TaskStatus.COMPLETED,
+        )
+        await self._state_manager.complete_task(task.mission_id, task)
+        logger.info(
+            "workflow.task_completed",
+            mission_id=str(task.mission_id),
+            task_id=str(task.id),
+            task_name=task.name,
+        )
+
+        if newly_ready:
+            await self._schedule_tasks(plan, newly_ready)
         await self._check_workflow_completion(task.mission_id)
 
     async def _fail_task(self, task: Task, error: str) -> None:
-        """Handle task failure in the workflow."""
-        task.status = TaskStatus.FAILED
-        task.error = error
-        await self._state_manager.fail_task(task.mission_id, task)
-
-        # Check if workflow should stop
-        await self._check_workflow_completion(task.mission_id)
-
-    async def _check_workflow_completion(self, mission_id: UUID) -> None:
-        """Check if all tasks are complete and finalize if so."""
-        plan = self._active_workflows.get(mission_id)
-        if not plan:
+        """Handle terminal task failure after scheduler retries are exhausted."""
+        plan = self._active_workflows.get(task.mission_id)
+        if plan is None:
             return
 
-        all_done = all(
-            task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.SKIPPED}
-            for task in plan.tasks
+        await self._planner.update_task_status(plan.id, task.id, TaskStatus.FAILED, error)
+        await self._state_manager.fail_task(task.mission_id, task)
+        logger.error(
+            "workflow.task_failed",
+            mission_id=str(task.mission_id),
+            task_id=str(task.id),
+            task_name=task.name,
+            error=error,
         )
 
-        if all_done:
-            logger.info(
-                "workflow.completed",
-                mission_id=str(mission_id),
-                total_tasks=plan.total_tasks,
-            )
-            self._active_workflows.pop(mission_id, None)
+        if task.required:
+            await self._scheduler.cancel_mission(task.mission_id, exclude_task_id=task.id)
+            self._mark_remaining_tasks(plan, TaskStatus.SKIPPED)
+            self._resolve_workflow(task.mission_id, WorkflowStatus.FAILED, error)
+        else:
+            await self._check_workflow_completion(task.mission_id)
 
-    def _register_default_handlers(self) -> None:
-        """Register default task handlers for standard capabilities."""
-        # These are placeholder handlers — real implementations
-        # are registered by the AI layer and tool plugins
-        pass
+    async def _check_workflow_completion(self, mission_id: UUID) -> None:
+        plan = self._active_workflows.get(mission_id)
+        if plan is None:
+            return
 
-    def register_handler(
+        if any(task.required and task.status == TaskStatus.FAILED for task in plan.tasks):
+            failed = next(task for task in plan.tasks if task.required and task.status == TaskStatus.FAILED)
+            self._resolve_workflow(mission_id, WorkflowStatus.FAILED, failed.error)
+            return
+
+        if all(task.status == TaskStatus.COMPLETED for task in plan.tasks):
+            self._resolve_workflow(mission_id, WorkflowStatus.SUCCESS)
+
+    async def _terminate_unfinished(
         self,
-        capability: str,
-        handler: Callable,
+        mission_id: UUID,
+        error: str,
+        status: WorkflowStatus,
     ) -> None:
-        """
-        Register a handler for a specific capability.
+        plan = self._active_workflows.get(mission_id)
+        if plan:
+            await self._scheduler.cancel_mission(mission_id)
+            self._mark_remaining_tasks(plan, TaskStatus.SKIPPED)
+        self._resolve_workflow(mission_id, status, error)
 
-        Args:
-            capability: The capability name (e.g., "port_scanning")
-            handler: Async function that handles tasks with this capability
-        """
-        self._task_handlers[capability] = handler
-        logger.debug(
-            "workflow.handler_registered",
-            capability=capability,
+    def _mark_remaining_tasks(self, plan: Plan, status: TaskStatus) -> None:
+        for task in plan.tasks:
+            if task.status not in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+                task.status = status
+                task.completed_at = datetime.now(timezone.utc)
+
+    def _resolve_workflow(
+        self,
+        mission_id: UUID,
+        status: WorkflowStatus,
+        error: Optional[str] = None,
+    ) -> None:
+        plan = self._active_workflows.pop(mission_id, None)
+        future = self._completion_futures.get(mission_id)
+        if plan is None or future is None or future.done():
+            return
+
+        result = WorkflowResult(
+            mission_id=mission_id,
+            plan_id=plan.id,
+            status=status,
+            total_tasks=len(plan.tasks),
+            completed_tasks=sum(t.status == TaskStatus.COMPLETED for t in plan.tasks),
+            failed_tasks=sum(t.status == TaskStatus.FAILED for t in plan.tasks),
+            skipped_tasks=sum(t.status == TaskStatus.SKIPPED for t in plan.tasks),
+            error=error,
+            started_at=self._workflow_started_at.pop(mission_id),
         )
+        future.set_result(result)
+        self._scheduled_tasks.pop(mission_id, None)
+
+        log = logger.info if result.succeeded else logger.error
+        log(
+            "workflow.completed" if result.succeeded else "workflow.failed",
+            mission_id=str(mission_id),
+            plan_id=str(plan.id),
+            status=result.status.value,
+            completed_tasks=result.completed_tasks,
+            failed_tasks=result.failed_tasks,
+            skipped_tasks=result.skipped_tasks,
+            error=error,
+        )
+
+    async def cancel_workflow(self, mission_id: UUID) -> Optional[WorkflowResult]:
+        """Cancel a workflow and resolve its waiter with a terminal result."""
+        future = self._completion_futures.get(mission_id)
+        if not future:
+            return None
+        await self._terminate_unfinished(
+            mission_id,
+            "Workflow cancelled by operator",
+            WorkflowStatus.CANCELLED,
+        )
+        return await asyncio.shield(future)
+
+    def register_handler(self, capability: str, handler: Callable[[Task], Any]) -> None:
+        self._task_handlers[capability] = handler
+        logger.debug("workflow.handler_registered", capability=capability)
+
+    def has_handler(self, capability: str) -> bool:
+        return capability in self._task_handlers
 
     def get_active_workflows(self) -> List[Dict[str, Any]]:
-        """Get summary of all active workflows."""
         return [
             {
                 "mission_id": str(mid),
+                "plan_id": str(plan.id),
                 "task_count": len(plan.tasks),
                 "status": "running",
             }
@@ -200,4 +329,9 @@ class WorkflowEngine:
         ]
 
 
-__all__ = ["WorkflowEngine"]
+__all__ = [
+    "MissingTaskHandlerError",
+    "WorkflowEngine",
+    "WorkflowResult",
+    "WorkflowStatus",
+]
